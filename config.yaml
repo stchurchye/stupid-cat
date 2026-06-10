@@ -1,0 +1,73 @@
+service:
+  host: "127.0.0.1"
+  port: 8765
+  pause_on_start: false
+
+inference:
+  device: "cpu"             # Win 生产在 config.local.yaml 覆盖为 cuda:0
+  yolo_model: "models/yolo11s.pt"
+  yolo_conf: 0.20
+  yolo_confirm_frames: 3
+  imgsz: 640
+  active_fps: 6
+  idle_fps: 1
+  motion_threshold: 25
+  min_crop_px: 80
+  reid_backbone: "efficientnet_b0"
+  similarity_threshold: 0.55
+  fusion: "weighted_median"
+  fusion_max_frames: 64
+
+cats:
+  min_refs: 5
+  seed:
+    - { id: mimi, name: "咪咪" }
+    - { id: cat2, name: "猫2" }
+    - { id: cat3, name: "猫3" }
+    - { id: cat4, name: "猫4" }
+    - { id: cat5, name: "猫5" }
+
+cameras:
+  - id: cam1
+    rtsp_url: "rtsp://user:pass@192.168.1.101:554/stream1"
+    weight: 0.5
+    stream_width: 1920
+    stream_height: 1080
+    roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+  - id: cam2
+    rtsp_url: "rtsp://user:pass@192.168.1.102:554/stream1"
+    weight: 0.5
+    stream_width: 1920
+    stream_height: 1080
+    roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+
+session:
+  roi_overlap_min: 0.25
+  enter_overlap_sec: 2.0
+  exit_no_cat_sec: 8.0
+  cooldown_sec: 3.0
+  min_visit_sec: 3.0
+
+preprocess:
+  input_mode: "bgr"
+  clahe_enabled: true
+  denoise_enabled: false
+
+recorder:
+  enabled: true
+  primary_camera: "cam1"
+  max_seconds: 30
+
+mqtt:
+  enabled: false
+  broker_host: "192.168.1.1"
+  broker_port: 1883
+  topic_prefix: "stupid-cat/visit"
+  username: ""
+  password: ""
+
+waste:
+  enabled: false
+  pee_max_duration_sec: 90
+  poop_min_duration_sec: 120
+  dig_motion_threshold: 40

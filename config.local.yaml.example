@@ -1,0 +1,16 @@
+# 复制为 config.local.yaml（已在 .gitignore，勿提交密码）
+# inference:
+#   device: "cuda:0"          # Win1060；Mac 可省略或 cpu
+
+# cameras:
+#   - id: cam1
+#     rtsp_url: "rtsp://user:pass@192.168.1.101:554/stream1"
+#     roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+#   - id: cam2
+#     rtsp_url: "rtsp://user:pass@192.168.1.102:554/stream1"
+#     roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+
+# session:
+#   enter_overlap_sec: 2.0
+#   exit_no_cat_sec: 8.0
+#   min_visit_sec: 3.0

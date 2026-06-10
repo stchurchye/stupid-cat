@@ -1,0 +1,19 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 1.5rem;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th,
+td {
+  border: 1px solid #ccc;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+td.recording video {
+  display: block;
+  max-width: 100%;
+  background: #111;
+}
