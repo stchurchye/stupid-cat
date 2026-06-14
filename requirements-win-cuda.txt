@@ -17,7 +17,7 @@
 torch==2.4.1+cu121
 torchvision==0.19.1+cu121
 ultralytics>=8.3,<9
-opencv-python-headless>=4.9
+opencv-python-headless>=4.10  # >=4.10 is the first numpy-2-ABI-compatible series
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pyyaml>=6.0

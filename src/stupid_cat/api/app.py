@@ -35,7 +35,7 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
             "device": pipeline.cfg.inference.device,
             "cuda_available": _cuda_available(),
             "cameras": cameras,
-            "active_visit_id": pipeline.fsm.visit_id,
+            "active_visit_id": pipeline.active_visit_id,
             "db_ok": True,
             "ingest_active": pipeline.ingest_active,
         }

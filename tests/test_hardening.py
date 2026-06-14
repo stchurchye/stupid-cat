@@ -13,11 +13,13 @@ import numpy as np
 import pytest
 import yaml
 
-from stupid_cat.config import ConfigError, load_config
+import cv2
+
+from stupid_cat.config import ConfigError, PreprocessConfig, load_config
 from stupid_cat.db import Database
 from stupid_cat.detector import CatDetector
 from stupid_cat.ingest import MultiCameraIngest
-from stupid_cat.reid import Embedder, fuse_embeddings
+from stupid_cat.reid import Embedder, build_centroid_from_refs, fuse_embeddings, ref_quality_ok
 from stupid_cat.session import VisitSessionFSM
 
 _REPO_CFG = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -224,3 +226,46 @@ def test_all_cameras_disabled_is_error(tmp_path: Path) -> None:
     cfg_path = _write_cfg(tmp_path, _disable_all)
     with pytest.raises(ConfigError, match="at least one camera must be enabled"):
         load_config(cfg_path)
+
+
+# --- reference-image quality gate (keeps dark IR, drops blank) ---------------
+
+
+def test_ref_quality_gate_keeps_dark_textured_drops_blank() -> None:
+    blank = np.full((40, 40, 3), 3, dtype=np.uint8)  # uniform near-black
+    bright_blank = np.full((40, 40, 3), 252, dtype=np.uint8)  # uniform near-white
+    dark_textured = np.full((40, 40, 3), 3, dtype=np.uint8)
+    dark_textured[8:32, 8:32] = 40  # a dark cat with real texture
+    tiny = np.full((8, 8, 3), 100, dtype=np.uint8)
+
+    assert ref_quality_ok(blank) is False
+    assert ref_quality_ok(bright_blank) is False
+    assert ref_quality_ok(dark_textured) is True  # low mean but real dynamic range
+    assert ref_quality_ok(tiny) is False  # too small
+
+
+class _FakeEmbedder:
+    def embed(self, frame: np.ndarray) -> np.ndarray:
+        vec = np.zeros(8, dtype=np.float32)
+        vec[0] = 1.0
+        return vec
+
+
+def test_build_centroid_keeps_dark_refs(tmp_path: Path) -> None:
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    for i in range(5):
+        img = np.full((40, 40, 3), 3, dtype=np.uint8)
+        img[6:34, 6:34] = 25 + i  # dark but textured
+        cv2.imwrite(str(refs / f"r{i}.jpg"), img)
+    centroid = build_centroid_from_refs(_FakeEmbedder(), refs, PreprocessConfig(), min_refs=5)
+    assert centroid is not None  # dark IR refs must NOT be rejected as blank
+
+
+def test_build_centroid_rejects_all_blank(tmp_path: Path) -> None:
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    for i in range(5):
+        cv2.imwrite(str(refs / f"b{i}.jpg"), np.zeros((40, 40, 3), dtype=np.uint8))
+    centroid = build_centroid_from_refs(_FakeEmbedder(), refs, PreprocessConfig(), min_refs=5)
+    assert centroid is None  # all uniform/blank -> skipped -> below min_refs

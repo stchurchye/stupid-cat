@@ -75,12 +75,19 @@ class RtspSource:
                 logger.warning("RTSP open failed for %s, retry in %.0fs", self.camera_id, self.reconnect_delay_sec)
                 time.sleep(self.reconnect_delay_sec)
                 continue
-            # Keep only the freshest frame so we process live video, not a
-            # growing backlog, when downstream is slower than the camera.
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except cv2.error:
-                pass
+            # Keep only the freshest frame (process live video, not a backlog),
+            # and bound read blocking so a stalled stream returns periodically.
+            for prop_name, value in (
+                ("CAP_PROP_BUFFERSIZE", 1),
+                ("CAP_PROP_READ_TIMEOUT_MSEC", 5000),
+                ("CAP_PROP_OPEN_TIMEOUT_MSEC", 5000),
+            ):
+                prop = getattr(cv2, prop_name, None)
+                if prop is not None:
+                    try:
+                        cap.set(prop, value)
+                    except cv2.error:
+                        pass
             logger.info("RTSP connected: %s", self.camera_id)
             try:
                 while True:
@@ -176,9 +183,17 @@ class MultiCameraIngest:
         except queue.Full:
             pass
         try:
-            self._queue.get_nowait()  # drop the oldest frame
+            dropped = self._queue.get_nowait()  # make room by dropping the oldest
         except queue.Empty:
-            pass
+            dropped = None
+        if dropped is _SENTINEL:
+            # Never discard a termination signal: put it back and drop this frame
+            # instead, or events() would wait forever for a sentinel that's gone.
+            try:
+                self._queue.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
+            return
         try:
             self._queue.put_nowait(event)
         except queue.Full:

@@ -18,7 +18,7 @@ from stupid_cat.detector import CatDetector, select_primary_bbox
 from stupid_cat.geometry import bbox_roi_overlap_ratio
 from stupid_cat.ingest import FrameEvent, FrameSource, MultiCameraIngest, VideoFileSource
 from stupid_cat.preprocess import preprocess_frame
-from stupid_cat.recorder import VisitRecorder
+from stupid_cat.recorder import VisitRecorder, reencode_for_browser
 from stupid_cat.reid import (
     EmbeddingBuffer,
     EmbeddingRecord,
@@ -27,6 +27,7 @@ from stupid_cat.reid import (
     fuse_embeddings,
     load_all_centroids,
     match_cat,
+    ref_quality_ok,
 )
 from stupid_cat.session import VisitSessionFSM
 
@@ -139,6 +140,12 @@ class Pipeline:
         for visit_id in ids:
             clip = self.recordings_dir / f"{visit_id}.mp4"
             if clip.exists():
+                # The clip was never finalized (writer not released on crash);
+                # best-effort re-encode so it is browser-playable, then relink.
+                try:
+                    reencode_for_browser(clip)
+                except Exception:  # noqa: BLE001
+                    logger.warning("could not re-encode recovered clip %s", clip)
                 try:
                     self.db.set_recording_path(visit_id, str(clip))
                 except Exception:  # noqa: BLE001
@@ -161,6 +168,12 @@ class Pipeline:
     @property
     def paused(self) -> bool:
         return self._paused.is_set()
+
+    @property
+    def active_visit_id(self) -> str | None:
+        """Current visit id, read under the lock (FSM is mutated on another thread)."""
+        with self._lock:
+            return self.fsm.visit_id
 
     def camera_health(self) -> list[dict[str, object]]:
         """Per-camera status for GET /health (spec §10)."""
@@ -293,7 +306,7 @@ class Pipeline:
         test stays in one coordinate space (spec §7.3).
         """
         roi = self.roi_by_camera.get(camera_id, [])
-        if not roi:
+        if not roi or frame_w <= 0 or frame_h <= 0:
             return roi
         sw, sh = self._stream_dims.get(camera_id, (frame_w, frame_h))
         if sw <= 0 or sh <= 0 or (sw == frame_w and sh == frame_h):
@@ -354,8 +367,10 @@ class Pipeline:
             # Keep the largest, clearest crop as the visit's representative for the
             # correction gallery — chosen by crop size, NOT by similarity to an
             # existing centroid (which would bias corrections toward whatever the
-            # model already guessed, a confirmation-bias drift trap).
-            if bbox_area > self._best_correction_area:
+            # model already guessed, a confirmation-bias drift trap). Must also
+            # pass the ref-quality gate, else the saved ref would be silently
+            # dropped at centroid-build time and the correction would no-op.
+            if bbox_area > self._best_correction_area and ref_quality_ok(crop):
                 self._best_correction_area = bbox_area
                 self._best_correction_crop = crop
 
@@ -401,7 +416,9 @@ class Pipeline:
         duration: float,
         discard: bool,
     ) -> None:
-        recording_path = self.recorder.stop()
+        # Skip the (background) browser re-encode when we're about to discard the
+        # clip, so it can't race the unlink below.
+        recording_path = self.recorder.stop(reencode=not discard)
         self._recording_path = None
 
         if discard:
@@ -489,68 +506,77 @@ class Pipeline:
         self.centroids = {**self.centroids, cat_id: centroid}
 
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
-        """DB correction plus optional ref append and centroid rebuild (spec §9.3)."""
-        with self._lock:
-            allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
-            if new_cat_id not in allowed:
-                raise ValueError(f"cat_id not registered: {new_cat_id}")
+        """DB correction plus optional ref append and centroid rebuild (spec §9.3).
 
-            self.db.correct_visit(visit_id, new_cat_id)
-            if new_cat_id == "unknown":
-                self._delete_correction_crop(visit_id)
-                return
+        The expensive centroid rebuild (a Re-ID forward pass per ref image) runs
+        WITHOUT the pipeline lock so an admin correction can't freeze frame
+        ingest / the FSM watchdog; only the cheap copy-on-write swap is locked.
+        The DB and Embedder each have their own internal locks.
+        """
+        allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
+        if new_cat_id not in allowed:
+            raise ValueError(f"cat_id not registered: {new_cat_id}")
 
-            crop = self._load_correction_crop(visit_id)
-            if crop is None:
-                logger.warning("no correction crop for visit %s; DB updated only", visit_id)
-                return
-
-            cat_dir = self._data_dir / "cats" / new_cat_id
-            refs_dir = cat_dir / "refs"
-            refs_dir.mkdir(parents=True, exist_ok=True)
-            ref_path = refs_dir / f"{visit_id}.jpg"
-            if not cv2.imwrite(str(ref_path), crop):
-                logger.warning("failed to write ref %s", ref_path)
-                return
-
+        self.db.correct_visit(visit_id, new_cat_id)
+        if new_cat_id == "unknown":
             self._delete_correction_crop(visit_id)
+            return
 
-            centroid = build_centroid_from_refs(
-                self.embedder,
-                refs_dir,
-                self.cfg.preprocess,
+        crop = self._load_correction_crop(visit_id)
+        if crop is None:
+            logger.warning("no correction crop for visit %s; DB updated only", visit_id)
+            return
+
+        cat_dir = self._data_dir / "cats" / new_cat_id
+        refs_dir = cat_dir / "refs"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        ref_path = refs_dir / f"{visit_id}.jpg"
+        if not cv2.imwrite(str(ref_path), crop):
+            logger.warning("failed to write ref %s", ref_path)
+            return
+
+        self._delete_correction_crop(visit_id)
+
+        centroid = build_centroid_from_refs(
+            self.embedder,
+            refs_dir,
+            self.cfg.preprocess,
+            self.cfg.cats.min_refs,
+        )
+        if centroid is None:
+            logger.info(
+                "ref saved for %s; centroid unchanged (need %d refs)",
+                new_cat_id,
                 self.cfg.cats.min_refs,
             )
-            if centroid is None:
-                logger.info(
-                    "ref saved for %s; centroid unchanged (need %d refs)",
-                    new_cat_id,
-                    self.cfg.cats.min_refs,
-                )
-                return
+            return
 
-            np.save(cat_dir / "centroid.npy", centroid)
+        np.save(cat_dir / "centroid.npy", centroid)
+        with self._lock:
             self._set_centroid(new_cat_id, centroid)
-            logger.info("rebuilt centroid for %s", new_cat_id)
+        logger.info("rebuilt centroid for %s", new_cat_id)
 
     def rebuild_cat_centroid(self, cat_id: str) -> bool:
-        """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding)."""
+        """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding).
+
+        Centroid build runs off the pipeline lock; only the swap-in is locked.
+        """
+        refs_dir = self._data_dir / "cats" / cat_id / "refs"
+        if not refs_dir.is_dir():
+            return False
+        centroid = build_centroid_from_refs(
+            self.embedder,
+            refs_dir,
+            self.cfg.preprocess,
+            self.cfg.cats.min_refs,
+        )
+        if centroid is None:
+            return False
+        cat_dir = refs_dir.parent
+        np.save(cat_dir / "centroid.npy", centroid)
         with self._lock:
-            refs_dir = self._data_dir / "cats" / cat_id / "refs"
-            if not refs_dir.is_dir():
-                return False
-            centroid = build_centroid_from_refs(
-                self.embedder,
-                refs_dir,
-                self.cfg.preprocess,
-                self.cfg.cats.min_refs,
-            )
-            if centroid is None:
-                return False
-            cat_dir = refs_dir.parent
-            np.save(cat_dir / "centroid.npy", centroid)
             self._set_centroid(cat_id, centroid)
-            return True
+        return True
 
 
 def _mono_now() -> float:

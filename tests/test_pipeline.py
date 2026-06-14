@@ -140,6 +140,19 @@ def test_recover_orphan_visits_on_construction(fast_pipeline: Pipeline, tmp_path
     assert row["ended_at"] is not None
 
 
+def test_disk_guard_skips_recording_when_low(fast_pipeline: Pipeline, monkeypatch) -> None:
+    import collections
+
+    import stupid_cat.pipeline as pipeline_mod
+
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(pipeline_mod.shutil, "disk_usage", lambda _p: usage(100, 100, 0))
+    assert fast_pipeline._disk_ok() is False
+    # min_free_mb <= 0 disables the guard entirely.
+    fast_pipeline.cfg.recorder.min_free_mb = 0
+    assert fast_pipeline._disk_ok() is True
+
+
 def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
     # Fixture calibrates the camera at 640x480.
     roi_full = fast_pipeline._roi_for_frame("cam1", 640, 480)

@@ -14,11 +14,12 @@ logger = logging.getLogger(__name__)
 FUSION_MODES = frozenset({"weighted_median", "weighted_mean", "best_frame"})
 
 # Conservative reference-image quality gate (spec §6.6): reject crops that are
-# too small or essentially blank (all black / all white) so they don't poison a
-# cat's centroid. Deliberately lenient so legitimate dim IR crops still pass.
+# too small or essentially blank (a flat patch with no texture) so they don't
+# poison a cat's centroid. The gate keys on dynamic range, NOT absolute
+# brightness, so a genuinely dark IR crop of a black cat (low mean but real
+# texture) still passes — only uniform all-black / all-white patches are dropped.
 _REF_MIN_SIDE = 16
-_REF_MIN_MEAN = 5.0
-_REF_MAX_MEAN = 250.0
+_REF_MIN_RANGE = 10  # max-min pixel value; below this the crop is effectively flat
 
 
 @dataclass
@@ -178,15 +179,18 @@ def load_centroid(path: Path | str) -> np.ndarray | None:
     return l2_normalize(np.load(path, allow_pickle=False))
 
 
-def _ref_quality_ok(frame: np.ndarray) -> bool:
-    """True if a reference crop is large enough and not essentially blank."""
+def ref_quality_ok(frame: np.ndarray) -> bool:
+    """True if a reference crop is large enough and has real texture.
+
+    Uses dynamic range (max-min) rather than absolute brightness so a dark IR
+    crop of a black cat is kept while a flat all-black/all-white patch is rejected.
+    """
     if frame.ndim < 2:
         return False
     h, w = frame.shape[:2]
     if min(h, w) < _REF_MIN_SIDE:
         return False
-    mean = float(np.mean(frame))
-    return _REF_MIN_MEAN <= mean <= _REF_MAX_MEAN
+    return int(frame.max()) - int(frame.min()) >= _REF_MIN_RANGE
 
 
 def build_centroid_from_refs(
@@ -218,7 +222,7 @@ def build_centroid_from_refs(
         if frame is None:
             skipped += 1
             continue
-        if not _ref_quality_ok(frame):
+        if not ref_quality_ok(frame):
             logger.warning("skipping low-quality reference image %s", path)
             skipped += 1
             continue

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -64,14 +65,23 @@ class VisitRecorder:
         self._frames_written += 1
         return True
 
-    def stop(self) -> Path | None:
+    def stop(self, *, reencode: bool = True) -> Path | None:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
         path = self._path
         self._path = None
-        if path is not None and self._fourcc == "mp4v":
-            reencode_for_browser(path)
+        if reencode and path is not None and self._fourcc == "mp4v":
+            # ffmpeg re-mux can take seconds and stop() runs inside the visit-end
+            # path that the pipeline holds a lock around — do it on a daemon thread
+            # so the 24/7 loop is never blocked. Skipped when the caller will
+            # discard the clip (reencode=False) to avoid racing the unlink.
+            threading.Thread(
+                target=reencode_for_browser,
+                args=(path,),
+                name=f"reencode-{path.stem}",
+                daemon=True,
+            ).start()
         return path
 
 
