@@ -1,0 +1,469 @@
+"""Main vision pipeline (spec §4)."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from stupid_cat.config import AppConfig, load_config
+from stupid_cat.db import Database
+from stupid_cat.detector import CatDetector, select_primary_bbox
+from stupid_cat.geometry import bbox_roi_overlap_ratio
+from stupid_cat.ingest import FrameEvent, FrameSource, MultiCameraIngest, VideoFileSource
+from stupid_cat.preprocess import preprocess_frame
+from stupid_cat.recorder import VisitRecorder
+from stupid_cat.reid import (
+    EmbeddingBuffer,
+    EmbeddingRecord,
+    Embedder,
+    build_centroid_from_refs,
+    fuse_embeddings,
+    load_all_centroids,
+    match_cat,
+    max_centroid_similarity,
+)
+from stupid_cat.session import VisitSessionFSM
+
+logger = logging.getLogger(__name__)
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _duration_seconds_wall(started_at: str, ended_at: str) -> int:
+    """Wall-clock visit duration per spec §8.2.5."""
+    start = datetime.fromisoformat(started_at)
+    end = datetime.fromisoformat(ended_at)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(0, int((end.astimezone(timezone.utc) - start.astimezone(timezone.utc)).total_seconds()))
+
+
+def _crop_bgr(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray:
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    return frame[y1:y2, x1:x2].copy()
+
+
+class Pipeline:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        *,
+        db: Database | None = None,
+        db_path: Path | str | None = None,
+        data_dir: Path | str | None = None,
+        detector: CatDetector | None = None,
+        embedder: Embedder | None = None,
+    ) -> None:
+        self.cfg = cfg
+        self._paused = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ingest_active = False
+
+        self._data_dir = Path(data_dir or "data")
+        self.db = db or Database(db_path or self._data_dir / "stupid_cat.db")
+        self.db.init_schema()
+        self.db.seed_cats([{"id": c.id, "name": c.name} for c in cfg.cats.seed])
+
+        self.detector = detector or CatDetector(cfg.inference)
+        self.embedder = embedder or Embedder(
+            device=cfg.inference.device,
+            backbone=cfg.inference.reid_backbone,
+        )
+        self.centroids = load_all_centroids(self._data_dir / "cats")
+        self.camera_weights = {c.id: c.weight for c in cfg.cameras}
+        self.roi_by_camera = {c.id: c.roi_polygon for c in cfg.cameras}
+
+        self.fsm = VisitSessionFSM(
+            camera_ids=[c.id for c in cfg.cameras],
+            enter_overlap_sec=cfg.session.enter_overlap_sec,
+            exit_no_cat_sec=cfg.session.exit_no_cat_sec,
+            cooldown_sec=cfg.session.cooldown_sec,
+            min_visit_sec=cfg.session.min_visit_sec,
+        )
+        self.recorder = VisitRecorder(
+            self._data_dir / "recordings",
+            max_seconds=cfg.recorder.max_seconds,
+            fps=float(cfg.inference.active_fps),
+        )
+
+        self._embedding_buffer: EmbeddingBuffer | None = None
+        self._recording_path: Path | None = None
+        self._camera_ids_seen: set[str] = set()
+        self._visit_started_at: str | None = None
+        self._best_correction_crop: np.ndarray | None = None
+        self._best_correction_score: float = -1.0
+        self._last_frame_at: dict[str, str] = {}
+        self._preview_lock = threading.Lock()
+        self._preview_frames: dict[str, np.ndarray] = {}
+        self._preview_boxes: dict[str, list[tuple[float, float, float, float]]] = {}
+        self._preview_qualified: dict[str, bool] = {}
+
+        self.fsm.on_visit_start = self._on_visit_start
+        self.fsm.on_visit_end = self._on_visit_end
+
+    @property
+    def ingest_active(self) -> bool:
+        return self._ingest_active
+
+    @property
+    def recordings_dir(self) -> Path:
+        return self._data_dir / "recordings"
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def camera_health(self) -> list[dict[str, object]]:
+        """Per-camera status for GET /health (spec §10)."""
+        rows: list[dict[str, object]] = []
+        for cam in self.cfg.cameras:
+            last_iso = self._last_frame_at.get(cam.id)
+            connected = False
+            if last_iso is not None:
+                try:
+                    last_dt = datetime.fromisoformat(last_iso)
+                    age = (datetime.now(timezone.utc) - last_dt.astimezone(timezone.utc)).total_seconds()
+                    connected = age < 30.0
+                except ValueError:
+                    connected = True
+            rows.append(
+                {
+                    "id": cam.id,
+                    "name": cam.name or cam.id,
+                    "connected": connected,
+                    "last_frame_at": last_iso,
+                    "fps_actual": None,
+                }
+            )
+        return rows
+
+    def camera_ids(self) -> list[str]:
+        return [c.id for c in self.cfg.cameras]
+
+    def get_preview_jpeg(self, camera_id: str, *, quality: int = 82) -> bytes | None:
+        with self._preview_lock:
+            frame = self._preview_frames.get(camera_id)
+            boxes = list(self._preview_boxes.get(camera_id, []))
+            qualified = self._preview_qualified.get(camera_id, False)
+            roi = list(self.roi_by_camera.get(camera_id, []))
+
+        if frame is None:
+            return None
+
+        annotated = frame.copy()
+        if len(roi) >= 3:
+            pts = np.array(roi, dtype=np.int32)
+            cv2.polylines(annotated, [pts], True, (0, 255, 0), 2)
+        for bbox in boxes:
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            color = (0, 200, 255) if qualified else (0, 0, 255)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        if qualified:
+            cv2.putText(
+                annotated,
+                "in ROI",
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 200, 255),
+                2,
+            )
+
+        ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return buf.tobytes() if ok else None
+
+    def pause(self) -> None:
+        """Pause ingest and end any active visit (spec §8.2.7)."""
+        self._paused.set()
+        self.fsm.pause(_mono_now())
+
+    def resume(self) -> None:
+        self._paused.clear()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def start_background(self, sources: list[FrameSource]) -> None:
+        self._thread = threading.Thread(
+            target=self.run,
+            args=(sources,),
+            name="stupid-cat-pipeline",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def run(self, sources: list[FrameSource]) -> None:
+        self._ingest_active = True
+        try:
+            ingest = MultiCameraIngest(
+                sources,
+                active_fps=float(self.cfg.inference.active_fps),
+                idle_fps=float(self.cfg.inference.idle_fps),
+                motion_threshold=float(self.cfg.inference.motion_threshold),
+            )
+            for event in ingest.events():
+                if self._stop.is_set():
+                    break
+                if self._paused.is_set():
+                    continue
+                self._process_frame(event)
+        finally:
+            self._ingest_active = False
+
+    def _correction_crop_path(self, visit_id: str) -> Path:
+        return self._data_dir / "correction_crops" / f"{visit_id}.jpg"
+
+    def _save_correction_crop(self, visit_id: str, crop: np.ndarray) -> None:
+        path = self._correction_crop_path(visit_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(path), crop):
+            logger.warning("failed to write correction crop %s", path)
+
+    def _load_correction_crop(self, visit_id: str) -> np.ndarray | None:
+        path = self._correction_crop_path(visit_id)
+        if not path.exists():
+            return None
+        crop = cv2.imread(str(path))
+        return crop
+
+    def _delete_correction_crop(self, visit_id: str) -> None:
+        self._correction_crop_path(visit_id).unlink(missing_ok=True)
+
+    def _process_frame(self, event: FrameEvent) -> None:
+        camera_id = event.camera_id
+        self._last_frame_at[camera_id] = _iso_now()
+
+        frame = preprocess_frame(event.frame_bgr, self.cfg.preprocess)
+        boxes = self.detector.detect(frame, camera_id)
+        primary = select_primary_bbox(boxes)
+        qualified = False
+        if primary is not None:
+            roi = self.roi_by_camera.get(camera_id, [])
+            overlap = bbox_roi_overlap_ratio(primary, roi)
+            qualified = overlap >= self.cfg.session.roi_overlap_min
+
+        self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
+
+        with self._preview_lock:
+            self._preview_frames[camera_id] = frame.copy()
+            self._preview_boxes[camera_id] = boxes
+            self._preview_qualified[camera_id] = qualified
+
+        if self.fsm.state != "active" or primary is None:
+            return
+
+        self._camera_ids_seen.add(camera_id)
+        if (
+            self.cfg.recorder.enabled
+            and camera_id == self.cfg.recorder.primary_camera
+            and self.fsm.visit_id
+        ):
+            if self._recording_path is None:
+                self._recording_path = self.recorder.start(self.fsm.visit_id, frame)
+            else:
+                self.recorder.write_frame(frame)
+
+        crop = _crop_bgr(frame, primary)
+        short_side = min(crop.shape[0], crop.shape[1])
+        if short_side < self.cfg.inference.min_crop_px:
+            return
+        if self._embedding_buffer is None:
+            return
+
+        area = float(short_side * short_side)
+        embedding = self.embedder.embed(crop)
+
+        score = max_centroid_similarity(embedding, self.centroids)
+        if score > self._best_correction_score:
+            self._best_correction_score = score
+            self._best_correction_crop = crop
+
+        self._embedding_buffer.add(
+            EmbeddingRecord(
+                embedding=embedding,
+                weight=self.camera_weights.get(camera_id, 0.5),
+                bbox_area=area,
+                timestamp=event.timestamp,
+            )
+        )
+
+    def _on_visit_start(self, visit_id: str) -> None:
+        self._embedding_buffer = EmbeddingBuffer(self.cfg.inference.fusion_max_frames)
+        self._camera_ids_seen = set()
+        self._recording_path = None
+        self._visit_started_at = _iso_now()
+        self._best_correction_crop = None
+        self._best_correction_score = -1.0
+        logger.info("visit started %s", visit_id)
+
+    def _on_visit_end(
+        self,
+        visit_id: str,
+        _started_mono: float,
+        _ended_mono: float,
+        duration: float,
+        discard: bool,
+    ) -> None:
+        recording_path = self.recorder.stop()
+        self._recording_path = None
+
+        if discard:
+            if recording_path and recording_path.exists():
+                recording_path.unlink(missing_ok=True)
+            self._embedding_buffer = None
+            self._best_correction_crop = None
+            self._best_correction_score = -1.0
+            self._delete_correction_crop(visit_id)
+            logger.info("visit %s discarded (duration %.2fs)", visit_id, duration)
+            return
+
+        if self._best_correction_crop is not None:
+            self._save_correction_crop(visit_id, self._best_correction_crop)
+        self._best_correction_crop = None
+        self._best_correction_score = -1.0
+
+        embs, weights = [], []
+        if self._embedding_buffer and len(self._embedding_buffer) > 0:
+            embs, weights = self._embedding_buffer.embeddings_and_weights()
+
+        if embs:
+            visit_vector = fuse_embeddings(
+                embs,
+                weights,
+                self.cfg.inference.fusion,
+                centroids=self.centroids or None,
+            )
+            cat_id, confidence = match_cat(
+                visit_vector,
+                self.centroids,
+                self.cfg.inference.similarity_threshold,
+            )
+            frames_used = len(self._embedding_buffer)
+        else:
+            cat_id, confidence = "unknown", 0.0
+            frames_used = 0
+
+        started_at = self._visit_started_at or _iso_now()
+        ended_at = _iso_now()
+        duration_sec = _duration_seconds_wall(started_at, ended_at)
+        self.db.create_visit(
+            visit_id=visit_id,
+            cat_id="unknown",
+            started_at=started_at,
+            camera_ids=sorted(self._camera_ids_seen),
+        )
+        self.db.end_visit(
+            visit_id,
+            cat_id=cat_id,
+            ended_at=ended_at,
+            duration_sec=duration_sec,
+            confidence=confidence,
+            frames_used=frames_used,
+            camera_ids=sorted(self._camera_ids_seen),
+            recording_path=str(recording_path) if recording_path else None,
+        )
+        self._visit_started_at = None
+        self._embedding_buffer = None
+        logger.info("visit ended %s cat=%s conf=%.2f", visit_id, cat_id, confidence)
+
+    def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
+        """DB correction plus optional ref append and centroid rebuild (spec §9.3)."""
+        allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
+        if new_cat_id not in allowed:
+            raise ValueError(f"cat_id not registered: {new_cat_id}")
+
+        self.db.correct_visit(visit_id, new_cat_id)
+        if new_cat_id == "unknown":
+            self._delete_correction_crop(visit_id)
+            return
+
+        crop = self._load_correction_crop(visit_id)
+        if crop is None:
+            logger.warning("no correction crop for visit %s; DB updated only", visit_id)
+            return
+
+        cat_dir = self._data_dir / "cats" / new_cat_id
+        refs_dir = cat_dir / "refs"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        ref_path = refs_dir / f"{visit_id}.jpg"
+        if not cv2.imwrite(str(ref_path), crop):
+            logger.warning("failed to write ref %s", ref_path)
+            return
+
+        self._delete_correction_crop(visit_id)
+
+        centroid = build_centroid_from_refs(
+            self.embedder,
+            refs_dir,
+            self.cfg.preprocess,
+            self.cfg.cats.min_refs,
+        )
+        if centroid is None:
+            logger.info(
+                "ref saved for %s; centroid unchanged (need %d refs)",
+                new_cat_id,
+                self.cfg.cats.min_refs,
+            )
+            return
+
+        np.save(cat_dir / "centroid.npy", centroid)
+        self.centroids[new_cat_id] = centroid
+        logger.info("rebuilt centroid for %s", new_cat_id)
+
+    def rebuild_cat_centroid(self, cat_id: str) -> bool:
+        """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding)."""
+        refs_dir = self._data_dir / "cats" / cat_id / "refs"
+        if not refs_dir.is_dir():
+            return False
+        centroid = build_centroid_from_refs(
+            self.embedder,
+            refs_dir,
+            self.cfg.preprocess,
+            self.cfg.cats.min_refs,
+        )
+        if centroid is None:
+            return False
+        cat_dir = refs_dir.parent
+        np.save(cat_dir / "centroid.npy", centroid)
+        self.centroids[cat_id] = centroid
+        return True
+
+
+def _mono_now() -> float:
+    return time.monotonic()
+
+
+def build_pipeline(
+    config_path: Path | str,
+    *,
+    local_config_path: Path | str | None = None,
+    video_path: Path | str | None = None,
+) -> tuple[Pipeline, list[FrameSource]]:
+    cfg = load_config(Path(config_path), local_path=local_config_path)
+    pipeline = Pipeline(cfg)
+
+    if video_path is not None:
+        cam_id = cfg.recorder.primary_camera
+        sources: list[FrameSource] = [VideoFileSource(cam_id, video_path)]
+        return pipeline, sources
+
+    from stupid_cat.ingest import RtspSource
+
+    sources = [RtspSource(c.id, c.rtsp_url) for c in cfg.cameras]
+    return pipeline, sources

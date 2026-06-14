@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>stupid-cat · 如厕统计</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top-bar">
+      <div class="top-bar-inner">
+        <a class="brand" href="/"><span>stupid-cat</span></a>
+        <nav class="nav">
+          <a href="/">时间线</a>
+          <a href="/live.html">实时画面</a>
+          <a href="/stats.html" class="active">如厕统计</a>
+        </nav>
+      </div>
+    </header>
+    <main class="page">
+      <div class="page-header">
+        <h1>如厕统计</h1>
+        <p class="subtitle">按猫咪与日期汇总 visit 次数与时长</p>
+        <div class="period-tabs" id="period-tabs">
+          <button type="button" class="period-tab active" data-days="7">近 7 天</button>
+          <button type="button" class="period-tab" data-days="30">近 30 天</button>
+          <button type="button" class="period-tab" data-days="0">全部</button>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="summary-cards"></div>
+
+      <div class="card" style="margin-bottom: 1rem">
+        <div class="card-section-title">每日次数</div>
+        <div class="card-body">
+          <div class="day-chart" id="day-chart"></div>
+        </div>
+      </div>
+
+      <div class="card table-wrap">
+        <div class="card-section-title">各猫明细</div>
+        <table id="cat-stats">
+          <thead>
+            <tr>
+              <th>猫咪</th>
+              <th>次数</th>
+              <th>总时长</th>
+              <th>平均时长</th>
+              <th>最近如厕</th>
+              <th>占比</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </main>
+    <script src="stats.js"></script>
+  </body>
+</html>

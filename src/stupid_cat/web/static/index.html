@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>stupid-cat · 时间线</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top-bar">
+      <div class="top-bar-inner">
+        <a class="brand" href="/"><span>stupid-cat</span></a>
+        <nav class="nav">
+          <a href="/" class="active">时间线</a>
+          <a href="/live.html">实时画面</a>
+          <a href="/stats.html">如厕统计</a>
+        </nav>
+      </div>
+    </header>
+    <main class="page">
+      <div class="page-header">
+        <h1>如厕时间线</h1>
+        <p class="subtitle">查看 visit 记录、播放录像，并在下拉框中标记是哪只猫</p>
+      </div>
+      <div class="card table-wrap">
+        <table id="visits">
+          <thead>
+            <tr>
+              <th>开始时间</th>
+              <th>猫咪</th>
+              <th>时长</th>
+              <th>置信度</th>
+              <th>录像</th>
+              <th>纠错</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
