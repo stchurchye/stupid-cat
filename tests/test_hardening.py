@@ -152,6 +152,28 @@ def test_threaded_ingest_reads_both_cameras() -> None:
     assert n_frames >= 2
 
 
+def test_ingest_terminates_with_many_cameras_under_backpressure() -> None:
+    # Regression: 3+ readers + a tiny queue + heavy drop-oldest must still let
+    # events() TERMINATE. Termination is tracked via a finished-counter, not a
+    # sentinel in the lossy queue, so dropping the oldest item can never lose a
+    # completion signal. (Heavy dropping may starve a camera — completeness is
+    # not guaranteed under maxsize=1; termination is.)
+    sources = [_ListSource(f"cam{i}", 20) for i in range(3)]
+    ingest = MultiCameraIngest(
+        sources,
+        active_fps=100000.0,
+        idle_fps=100000.0,
+        motion_threshold=0.0,
+        queue_maxsize=1,  # maximal backpressure / dropping
+        poll_timeout=0.02,
+    )
+    frames = 0
+    for event in ingest.events():  # reaching the end proves it terminated (no hang)
+        if event is not None:
+            frames += 1
+    assert frames >= 1
+
+
 def test_ingest_emits_heartbeat_while_a_source_is_blocked() -> None:
     release = threading.Event()
 

@@ -16,9 +16,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Sentinel pushed by a reader thread when its source is exhausted.
-_SENTINEL = object()
-
 
 @dataclass(frozen=True)
 class FrameEvent:
@@ -175,25 +172,25 @@ class MultiCameraIngest:
         self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Count of readers that have exited. Tracked out-of-band (NOT via a
+        # sentinel in the bounded drop-oldest queue) so a dropped item can never
+        # lose a termination signal — which would otherwise hang events() for
+        # 3+ cameras under backpressure.
+        self._finished = 0
+        self._finished_lock = threading.Lock()
 
     def _put_drop_oldest(self, event: FrameEvent) -> None:
+        # The queue carries frames only; dropping the oldest can never lose a
+        # termination signal because readers signal completion via _finished.
         try:
             self._queue.put_nowait(event)
             return
         except queue.Full:
             pass
         try:
-            dropped = self._queue.get_nowait()  # make room by dropping the oldest
+            self._queue.get_nowait()  # make room by dropping the oldest frame
         except queue.Empty:
-            dropped = None
-        if dropped is _SENTINEL:
-            # Never discard a termination signal: put it back and drop this frame
-            # instead, or events() would wait forever for a sentinel that's gone.
-            try:
-                self._queue.put_nowait(_SENTINEL)
-            except queue.Full:
-                pass
-            return
+            pass
         try:
             self._queue.put_nowait(event)
         except queue.Full:
@@ -213,7 +210,12 @@ class MultiCameraIngest:
         except Exception:  # noqa: BLE001 - one camera must not kill the others
             logger.exception("ingest reader for %s crashed", getattr(source, "camera_id", "?"))
         finally:
-            self._queue.put(_SENTINEL)
+            with self._finished_lock:
+                self._finished += 1
+
+    def _all_finished(self) -> bool:
+        with self._finished_lock:
+            return self._finished >= len(self._threads)
 
     def events(self) -> Generator[FrameEvent | None, None, None]:
         self._threads = [
@@ -228,15 +230,15 @@ class MultiCameraIngest:
         for thread in self._threads:
             thread.start()
 
-        remaining = len(self._threads)
-        while remaining > 0 and not self._stop.is_set():
+        while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=self._poll_timeout)
             except queue.Empty:
-                yield None  # heartbeat: no frames arrived (possible total outage)
-                continue
-            if item is _SENTINEL:
-                remaining -= 1
+                # Terminate once every reader has exited and the queue is drained;
+                # otherwise emit a heartbeat so the consumer can drive timeouts.
+                if self._all_finished() and self._queue.empty():
+                    break
+                yield None
                 continue
             yield item
 
