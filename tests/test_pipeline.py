@@ -107,6 +107,46 @@ def test_visit_duration_uses_wall_clock(fast_pipeline: Pipeline) -> None:
     assert visit["duration_sec"] == expected
 
 
+def test_visit_row_exists_during_active_visit(fast_pipeline: Pipeline) -> None:
+    # Persisting at visit start means an active (un-ended) row exists, so a crash
+    # mid-visit is recoverable instead of losing the visit entirely.
+    t = 0.0
+    for _ in range(5):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    active_id = fast_pipeline.fsm.visit_id
+    assert active_id is not None
+    row = fast_pipeline.db.get_visit(active_id)
+    assert row is not None
+    assert row["ended_at"] is None
+    # Not yet finalized, so it must not appear in the ended-only timeline.
+    assert fast_pipeline.db.list_visits(only_ended=True) == []
+
+
+def test_recover_orphan_visits_on_construction(fast_pipeline: Pipeline, tmp_path: Path) -> None:
+    # Simulate a crash: an open visit row with no ended_at.
+    orphan = fast_pipeline.db.create_visit(
+        cat_id="unknown", started_at="2026-06-02T10:00:00+08:00"
+    )
+    assert fast_pipeline.db.get_visit(orphan)["ended_at"] is None
+
+    # Re-running recovery (as __init__ does) finalizes it.
+    fast_pipeline._recover_orphan_visits()
+    row = fast_pipeline.db.get_visit(orphan)
+    assert row["ended_at"] is not None
+
+
+def test_set_centroid_is_copy_on_write(fast_pipeline: Pipeline) -> None:
+    fast_pipeline.centroids = {"a": np.ones(4, dtype=np.float32)}
+    snapshot = fast_pipeline.centroids
+    fast_pipeline._set_centroid("b", np.zeros(4, dtype=np.float32))
+    # The live dict gained the new key; the captured snapshot is untouched, so a
+    # concurrent reader iterating the snapshot can never see a mid-write mutation.
+    assert "b" in fast_pipeline.centroids
+    assert "b" not in snapshot
+    assert fast_pipeline.centroids is not snapshot
+
+
 def test_correct_visit_appends_ref(fast_pipeline: Pipeline, tmp_path: Path) -> None:
     visit_id = "visit-test-1"
     crop = np.zeros((100, 100, 3), dtype=np.uint8)

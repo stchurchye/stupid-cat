@@ -72,6 +72,10 @@ class Pipeline:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._ingest_active = False
+        self._ingest: MultiCameraIngest | None = None
+        # Guards all state shared between the pipeline thread and API threads:
+        # the FSM, centroids, embedding buffer, recorder, and per-visit fields.
+        self._lock = threading.RLock()
 
         self._data_dir = Path(data_dir or "data")
         self.db = db or Database(db_path or self._data_dir / "stupid_cat.db")
@@ -111,6 +115,29 @@ class Pipeline:
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
 
+        self._recover_orphan_visits()
+
+    def _recover_orphan_visits(self) -> None:
+        """Finalize visits left open by a previous crash and relink any clips."""
+        try:
+            ids = self.db.finalize_orphan_visits()
+        except Exception:  # noqa: BLE001 - recovery must never block startup
+            logger.exception("orphan visit recovery failed")
+            return
+        for visit_id in ids:
+            clip = self.recordings_dir / f"{visit_id}.mp4"
+            if clip.exists():
+                try:
+                    self.db.set_recording_path(visit_id, str(clip))
+                except Exception:  # noqa: BLE001
+                    logger.exception("could not relink recording for %s", visit_id)
+        if ids:
+            logger.warning(
+                "recovered %d interrupted visit(s) from a previous run: %s",
+                len(ids),
+                ids,
+            )
+
     @property
     def ingest_active(self) -> bool:
         return self._ingest_active
@@ -125,9 +152,11 @@ class Pipeline:
 
     def camera_health(self) -> list[dict[str, object]]:
         """Per-camera status for GET /health (spec §10)."""
+        with self._lock:
+            last_frame_at = dict(self._last_frame_at)
         rows: list[dict[str, object]] = []
         for cam in self.cfg.cameras:
-            last_iso = self._last_frame_at.get(cam.id)
+            last_iso = last_frame_at.get(cam.id)
             connected = False
             if last_iso is not None:
                 try:
@@ -149,13 +178,16 @@ class Pipeline:
     def pause(self) -> None:
         """Pause ingest and end any active visit (spec §8.2.7)."""
         self._paused.set()
-        self.fsm.pause(_mono_now())
+        with self._lock:
+            self.fsm.pause(_mono_now())
 
     def resume(self) -> None:
         self._paused.clear()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._ingest is not None:
+            self._ingest.stop()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
@@ -169,21 +201,36 @@ class Pipeline:
         self._thread.start()
 
     def run(self, sources: list[FrameSource]) -> None:
+        ingest = MultiCameraIngest(
+            sources,
+            active_fps=float(self.cfg.inference.active_fps),
+            idle_fps=float(self.cfg.inference.idle_fps),
+            motion_threshold=float(self.cfg.inference.motion_threshold),
+        )
+        self._ingest = ingest
         self._ingest_active = True
         try:
-            ingest = MultiCameraIngest(
-                sources,
-                active_fps=float(self.cfg.inference.active_fps),
-                idle_fps=float(self.cfg.inference.idle_fps),
-                motion_threshold=float(self.cfg.inference.motion_threshold),
-            )
             for event in ingest.events():
                 if self._stop.is_set():
                     break
+                if event is None:
+                    # Heartbeat during an outage: let the FSM time out an active
+                    # visit even though no frames are arriving.
+                    if not self._paused.is_set():
+                        with self._lock:
+                            self.fsm.on_tick(_mono_now())
+                    continue
                 if self._paused.is_set():
                     continue
-                self._process_frame(event)
+                try:
+                    self._process_frame(event)
+                except Exception:  # noqa: BLE001 - one bad frame must not kill 24/7 ingest
+                    logger.exception(
+                        "error processing frame from %s; skipping", event.camera_id
+                    )
         finally:
+            ingest.stop()
+            self._ingest = None
             self._ingest_active = False
 
     def _correction_crop_path(self, visit_id: str) -> Path:
@@ -207,7 +254,6 @@ class Pipeline:
 
     def _process_frame(self, event: FrameEvent) -> None:
         camera_id = event.camera_id
-        self._last_frame_at[camera_id] = _iso_now()
 
         frame = preprocess_frame(event.frame_bgr, self.cfg.preprocess)
         boxes = self.detector.detect(frame, camera_id)
@@ -218,53 +264,71 @@ class Pipeline:
             overlap = bbox_roi_overlap_ratio(primary, roi)
             qualified = overlap >= self.cfg.session.roi_overlap_min
 
-        self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
+        with self._lock:
+            self._last_frame_at[camera_id] = _iso_now()
+            self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
 
-        if self.fsm.state != "active" or primary is None:
-            return
+            if self.fsm.state != "active" or primary is None:
+                return
 
-        self._camera_ids_seen.add(camera_id)
-        if (
-            self.cfg.recorder.enabled
-            and camera_id == self.cfg.recorder.primary_camera
-            and self.fsm.visit_id
-        ):
-            if self._recording_path is None:
-                self._recording_path = self.recorder.start(self.fsm.visit_id, frame)
-            else:
-                self.recorder.write_frame(frame)
+            self._camera_ids_seen.add(camera_id)
+            if (
+                self.cfg.recorder.enabled
+                and camera_id == self.cfg.recorder.primary_camera
+                and self.fsm.visit_id
+            ):
+                if self._recording_path is None:
+                    self._recording_path = self.recorder.start(self.fsm.visit_id, frame)
+                else:
+                    self.recorder.write_frame(frame)
 
-        crop = _crop_bgr(frame, primary)
-        short_side = min(crop.shape[0], crop.shape[1])
-        if short_side < self.cfg.inference.min_crop_px:
-            return
-        if self._embedding_buffer is None:
-            return
+            crop = _crop_bgr(frame, primary)
+            short_side = min(crop.shape[0], crop.shape[1])
+            if short_side < self.cfg.inference.min_crop_px:
+                return
+            if self._embedding_buffer is None:
+                return
 
-        area = float(short_side * short_side)
-        embedding = self.embedder.embed(crop)
+            embedding = self.embedder.embed(crop)
 
-        score = max_centroid_similarity(embedding, self.centroids)
-        if score > self._best_correction_score:
-            self._best_correction_score = score
-            self._best_correction_crop = crop
+            score = max_centroid_similarity(embedding, self.centroids)
+            if score > self._best_correction_score:
+                self._best_correction_score = score
+                self._best_correction_crop = crop
 
-        self._embedding_buffer.add(
-            EmbeddingRecord(
-                embedding=embedding,
-                weight=self.camera_weights.get(camera_id, 0.5),
-                bbox_area=area,
-                timestamp=event.timestamp,
+            # True bbox area (width * height) so buffer eviction keeps the
+            # largest crops as spec §8.6 intends (was short_side**2 before).
+            bbox_area = max(0.0, primary[2] - primary[0]) * max(0.0, primary[3] - primary[1])
+            self._embedding_buffer.add(
+                EmbeddingRecord(
+                    embedding=embedding,
+                    weight=self.camera_weights.get(camera_id, 0.5),
+                    bbox_area=bbox_area,
+                    timestamp=event.timestamp,
+                )
             )
-        )
 
     def _on_visit_start(self, visit_id: str) -> None:
+        # Defensively close any writer left open by an abnormally-ended visit so
+        # we never leak a handle or keep writing into the wrong file.
+        self.recorder.stop()
         self._embedding_buffer = EmbeddingBuffer(self.cfg.inference.fusion_max_frames)
         self._camera_ids_seen = set()
         self._recording_path = None
         self._visit_started_at = _iso_now()
         self._best_correction_crop = None
         self._best_correction_score = -1.0
+        # Persist the visit at START so a crash mid-visit leaves a recoverable
+        # row instead of losing it entirely (finalized on next startup).
+        try:
+            self.db.create_visit(
+                visit_id=visit_id,
+                cat_id="unknown",
+                started_at=self._visit_started_at,
+                camera_ids=[],
+            )
+        except Exception:  # noqa: BLE001 - never let a DB hiccup kill the FSM
+            logger.exception("failed to persist visit start %s", visit_id)
         logger.info("visit started %s", visit_id)
 
     def _on_visit_end(
@@ -285,6 +349,11 @@ class Pipeline:
             self._best_correction_crop = None
             self._best_correction_score = -1.0
             self._delete_correction_crop(visit_id)
+            # Row was created at visit start; drop it since the visit is discarded.
+            try:
+                self.db.delete_visit(visit_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to delete discarded visit %s", visit_id)
             logger.info("visit %s discarded (duration %.2fs)", visit_id, duration)
             return
 
@@ -317,87 +386,109 @@ class Pipeline:
         started_at = self._visit_started_at or _iso_now()
         ended_at = _iso_now()
         duration_sec = _duration_seconds_wall(started_at, ended_at)
-        self.db.create_visit(
-            visit_id=visit_id,
-            cat_id="unknown",
-            started_at=started_at,
-            camera_ids=sorted(self._camera_ids_seen),
-        )
-        self.db.end_visit(
-            visit_id,
-            cat_id=cat_id,
-            ended_at=ended_at,
-            duration_sec=duration_sec,
-            confidence=confidence,
-            frames_used=frames_used,
-            camera_ids=sorted(self._camera_ids_seen),
-            recording_path=str(recording_path) if recording_path else None,
-        )
+        camera_ids = sorted(self._camera_ids_seen)
+
+        def _finalize() -> None:
+            self.db.end_visit(
+                visit_id,
+                cat_id=cat_id,
+                ended_at=ended_at,
+                duration_sec=duration_sec,
+                confidence=confidence,
+                frames_used=frames_used,
+                camera_ids=camera_ids,
+                recording_path=str(recording_path) if recording_path else None,
+            )
+
+        # The row was created at visit start; if it is somehow missing (start
+        # write failed), recreate it so the visit is not lost.
+        try:
+            _finalize()
+        except KeyError:
+            self.db.create_visit(
+                visit_id=visit_id,
+                cat_id="unknown",
+                started_at=started_at,
+                camera_ids=camera_ids,
+            )
+            _finalize()
+
         self._visit_started_at = None
         self._embedding_buffer = None
         logger.info("visit ended %s cat=%s conf=%.2f", visit_id, cat_id, confidence)
 
+    def _set_centroid(self, cat_id: str, centroid: np.ndarray) -> None:
+        """Replace the centroids dict atomically (copy-on-write).
+
+        Readers in the pipeline thread snapshot ``self.centroids`` and iterate the
+        snapshot, so rebinding here can never raise "dict changed size during
+        iteration"; the lock additionally serializes concurrent writers.
+        """
+        self.centroids = {**self.centroids, cat_id: centroid}
+
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
         """DB correction plus optional ref append and centroid rebuild (spec §9.3)."""
-        allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
-        if new_cat_id not in allowed:
-            raise ValueError(f"cat_id not registered: {new_cat_id}")
+        with self._lock:
+            allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
+            if new_cat_id not in allowed:
+                raise ValueError(f"cat_id not registered: {new_cat_id}")
 
-        self.db.correct_visit(visit_id, new_cat_id)
-        if new_cat_id == "unknown":
+            self.db.correct_visit(visit_id, new_cat_id)
+            if new_cat_id == "unknown":
+                self._delete_correction_crop(visit_id)
+                return
+
+            crop = self._load_correction_crop(visit_id)
+            if crop is None:
+                logger.warning("no correction crop for visit %s; DB updated only", visit_id)
+                return
+
+            cat_dir = self._data_dir / "cats" / new_cat_id
+            refs_dir = cat_dir / "refs"
+            refs_dir.mkdir(parents=True, exist_ok=True)
+            ref_path = refs_dir / f"{visit_id}.jpg"
+            if not cv2.imwrite(str(ref_path), crop):
+                logger.warning("failed to write ref %s", ref_path)
+                return
+
             self._delete_correction_crop(visit_id)
-            return
 
-        crop = self._load_correction_crop(visit_id)
-        if crop is None:
-            logger.warning("no correction crop for visit %s; DB updated only", visit_id)
-            return
-
-        cat_dir = self._data_dir / "cats" / new_cat_id
-        refs_dir = cat_dir / "refs"
-        refs_dir.mkdir(parents=True, exist_ok=True)
-        ref_path = refs_dir / f"{visit_id}.jpg"
-        if not cv2.imwrite(str(ref_path), crop):
-            logger.warning("failed to write ref %s", ref_path)
-            return
-
-        self._delete_correction_crop(visit_id)
-
-        centroid = build_centroid_from_refs(
-            self.embedder,
-            refs_dir,
-            self.cfg.preprocess,
-            self.cfg.cats.min_refs,
-        )
-        if centroid is None:
-            logger.info(
-                "ref saved for %s; centroid unchanged (need %d refs)",
-                new_cat_id,
+            centroid = build_centroid_from_refs(
+                self.embedder,
+                refs_dir,
+                self.cfg.preprocess,
                 self.cfg.cats.min_refs,
             )
-            return
+            if centroid is None:
+                logger.info(
+                    "ref saved for %s; centroid unchanged (need %d refs)",
+                    new_cat_id,
+                    self.cfg.cats.min_refs,
+                )
+                return
 
-        np.save(cat_dir / "centroid.npy", centroid)
-        self.centroids[new_cat_id] = centroid
-        logger.info("rebuilt centroid for %s", new_cat_id)
+            np.save(cat_dir / "centroid.npy", centroid)
+            self._set_centroid(new_cat_id, centroid)
+            logger.info("rebuilt centroid for %s", new_cat_id)
 
     def rebuild_cat_centroid(self, cat_id: str) -> bool:
         """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding)."""
-        refs_dir = self._data_dir / "cats" / cat_id / "refs"
-        if not refs_dir.is_dir():
-            return False
-        centroid = build_centroid_from_refs(
-            self.embedder,
-            refs_dir,
-            self.cfg.preprocess,
-            self.cfg.cats.min_refs,
-        )
-        if centroid is None:
-            return False
-        cat_dir = refs_dir.parent
-        np.save(cat_dir / "centroid.npy", centroid)
-        self.centroids[cat_id] = centroid
-        return True
+        with self._lock:
+            refs_dir = self._data_dir / "cats" / cat_id / "refs"
+            if not refs_dir.is_dir():
+                return False
+            centroid = build_centroid_from_refs(
+                self.embedder,
+                refs_dir,
+                self.cfg.preprocess,
+                self.cfg.cats.min_refs,
+            )
+            if centroid is None:
+                return False
+            cat_dir = refs_dir.parent
+            np.save(cat_dir / "centroid.npy", centroid)
+            self._set_centroid(cat_id, centroid)
+            return True
 
 
 def _mono_now() -> float:

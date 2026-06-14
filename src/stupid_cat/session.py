@@ -73,6 +73,20 @@ class VisitSessionFSM:
         if self.enter_accumulator >= self.enter_overlap_sec:
             self._start_visit(timestamp)
 
+    def on_tick(self, timestamp: float) -> None:
+        """Wall-clock watchdog: end an active visit even when no frames arrive.
+
+        Without this, a total camera outage during a visit leaves the FSM stuck
+        in ``active`` forever, since exit is only evaluated on frame arrival.
+        Only advances time forward and never refreshes per-camera qualification.
+        """
+        if self.state != "active":
+            return
+        if self._last_ts is not None and timestamp <= self._last_ts:
+            return
+        self._last_ts = timestamp
+        self._maybe_end_visit(timestamp)
+
     def pause(self, timestamp: float) -> None:
         if self.state == "active":
             self._end_visit(timestamp, enter_cooldown=False)
