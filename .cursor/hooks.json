@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": ".cursor/hooks/session-context.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": ".cursor/hooks/verify-and-continue.sh",
+        "loop_limit": 12
+      }
+    ]
+  }
+}
