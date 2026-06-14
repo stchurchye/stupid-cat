@@ -124,6 +124,7 @@ class Pipeline:
         self._last_frame_at: dict[str, str] = {}
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
+        self._consecutive_frame_errors = 0
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -137,19 +138,24 @@ class Pipeline:
         except Exception:  # noqa: BLE001 - recovery must never block startup
             logger.exception("orphan visit recovery failed")
             return
+        clips_to_reencode: list[Path] = []
         for visit_id in ids:
             clip = self.recordings_dir / f"{visit_id}.mp4"
             if clip.exists():
-                # The clip was never finalized (writer not released on crash);
-                # best-effort re-encode so it is browser-playable, then relink.
-                try:
-                    reencode_for_browser(clip)
-                except Exception:  # noqa: BLE001
-                    logger.warning("could not re-encode recovered clip %s", clip)
                 try:
                     self.db.set_recording_path(visit_id, str(clip))
                 except Exception:  # noqa: BLE001
                     logger.exception("could not relink recording for %s", visit_id)
+                clips_to_reencode.append(clip)
+        # Re-encode recovered clips off the startup-critical path so ingest can
+        # begin immediately instead of blocking on serial ffmpeg transcodes.
+        if clips_to_reencode:
+            threading.Thread(
+                target=self._reencode_clips,
+                args=(clips_to_reencode,),
+                name="recover-reencode",
+                daemon=True,
+            ).start()
         if ids:
             logger.warning(
                 "recovered %d interrupted visit(s) from a previous run: %s",
@@ -157,9 +163,23 @@ class Pipeline:
                 ids,
             )
 
+    @staticmethod
+    def _reencode_clips(clips: list[Path]) -> None:
+        for clip in clips:
+            try:
+                reencode_for_browser(clip)
+            except Exception:  # noqa: BLE001
+                logger.warning("could not re-encode recovered clip %s", clip)
+
     @property
     def ingest_active(self) -> bool:
         return self._ingest_active
+
+    @property
+    def frame_error_streak(self) -> int:
+        """Consecutive _process_frame failures; a high value means a persistent
+        fault (bad model/GPU) is degrading the pipeline into a no-op loop."""
+        return self._consecutive_frame_errors
 
     @property
     def recordings_dir(self) -> Path:
@@ -242,16 +262,23 @@ class Pipeline:
                     # Heartbeat during an outage: let the FSM time out an active
                     # visit even though no frames are arriving.
                     if not self._paused.is_set():
-                        with self._lock:
-                            self.fsm.on_tick(_mono_now())
+                        try:
+                            with self._lock:
+                                self.fsm.on_tick(_mono_now())
+                        except Exception:  # noqa: BLE001 - watchdog must not kill ingest
+                            logger.exception("error in watchdog tick; skipping")
                     continue
                 if self._paused.is_set():
                     continue
                 try:
                     self._process_frame(event)
+                    self._consecutive_frame_errors = 0
                 except Exception:  # noqa: BLE001 - one bad frame must not kill 24/7 ingest
+                    self._consecutive_frame_errors += 1
                     logger.exception(
-                        "error processing frame from %s; skipping", event.camera_id
+                        "error processing frame from %s; skipping (streak=%d)",
+                        event.camera_id,
+                        self._consecutive_frame_errors,
                     )
         finally:
             ingest.stop()
@@ -353,31 +380,37 @@ class Pipeline:
 
             crop = _crop_bgr(frame, primary)
             short_side = min(crop.shape[0], crop.shape[1])
-            if short_side < self.cfg.inference.min_crop_px:
+            if short_side < self.cfg.inference.min_crop_px or self._embedding_buffer is None:
                 return
-            if self._embedding_buffer is None:
-                return
-
-            embedding = self.embedder.embed(crop)
-
             # True bbox area (width * height) so buffer eviction keeps the
             # largest crops as spec §8.6 intends (was short_side**2 before).
             bbox_area = max(0.0, primary[2] - primary[0]) * max(0.0, primary[3] - primary[1])
+            weight = self.camera_weights.get(camera_id, 0.5)
+            visit_id = self.fsm.visit_id
 
+        # Re-ID forward pass is the slow part — run it WITHOUT the lock so the API
+        # (/health) and the FSM watchdog aren't blocked for the inference time.
+        # `crop` is a private copy and the Embedder is internally locked.
+        embedding = self.embedder.embed(crop)
+        crop_ok = ref_quality_ok(crop)
+
+        with self._lock:
+            # The visit may have ended (e.g. via pause) while we embedded; only
+            # attach to the still-current visit's buffer.
+            if self._embedding_buffer is None or self.fsm.visit_id != visit_id:
+                return
             # Keep the largest, clearest crop as the visit's representative for the
             # correction gallery — chosen by crop size, NOT by similarity to an
             # existing centroid (which would bias corrections toward whatever the
-            # model already guessed, a confirmation-bias drift trap). Must also
-            # pass the ref-quality gate, else the saved ref would be silently
-            # dropped at centroid-build time and the correction would no-op.
-            if bbox_area > self._best_correction_area and ref_quality_ok(crop):
+            # model already guessed). Must also pass the ref-quality gate, else the
+            # saved ref would be dropped at centroid-build time (correction no-op).
+            if bbox_area > self._best_correction_area and crop_ok:
                 self._best_correction_area = bbox_area
                 self._best_correction_crop = crop
-
             self._embedding_buffer.add(
                 EmbeddingRecord(
                     embedding=embedding,
-                    weight=self.camera_weights.get(camera_id, 0.5),
+                    weight=weight,
                     bbox_area=bbox_area,
                     timestamp=event.timestamp,
                 )

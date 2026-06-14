@@ -19,7 +19,11 @@ FUSION_MODES = frozenset({"weighted_median", "weighted_mean", "best_frame"})
 # brightness, so a genuinely dark IR crop of a black cat (low mean but real
 # texture) still passes — only uniform all-black / all-white patches are dropped.
 _REF_MIN_SIDE = 16
-_REF_MIN_RANGE = 10  # max-min pixel value; below this the crop is effectively flat
+# p99-p1 pixel spread; below this the crop is effectively flat. Uses percentiles
+# (not raw max-min) so a single hot/dead sensor pixel can't make a blank patch
+# look textured, and a modest threshold so genuinely low-contrast dark IR crops
+# of a black cat still pass.
+_REF_MIN_RANGE = 6
 
 
 @dataclass
@@ -190,7 +194,8 @@ def ref_quality_ok(frame: np.ndarray) -> bool:
     h, w = frame.shape[:2]
     if min(h, w) < _REF_MIN_SIDE:
         return False
-    return int(frame.max()) - int(frame.min()) >= _REF_MIN_RANGE
+    lo, hi = np.percentile(frame, (1, 99))
+    return float(hi) - float(lo) >= _REF_MIN_RANGE
 
 
 def build_centroid_from_refs(

@@ -26,7 +26,10 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         cameras = pipeline.camera_health()
         if pipeline.ingest_active:
             any_disconnected = any(not c["connected"] for c in cameras)
-            status = "degraded" if any_disconnected else "ok"
+            # A sustained run of frame errors (bad model/GPU) means the pipeline
+            # is alive but producing nothing — surface that as degraded.
+            stuck = pipeline.frame_error_streak >= 30
+            status = "degraded" if (any_disconnected or stuck) else "ok"
         else:
             status = "ok"
         return {

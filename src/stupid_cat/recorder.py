@@ -134,3 +134,10 @@ def reencode_for_browser(path: Path) -> bool:
         logger.warning("ffmpeg reencode failed for %s: %s", path, exc.stderr.decode(errors="replace")[:200])
         tmp.unlink(missing_ok=True)
         return False
+    except OSError as exc:
+        # On Windows os.replace raises PermissionError/OSError if the target is
+        # open (e.g. being served/played); don't let the daemon thread die or
+        # leak the temp file.
+        logger.warning("could not replace %s after reencode: %s", path, exc)
+        tmp.unlink(missing_ok=True)
+        return False

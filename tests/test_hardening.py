@@ -18,7 +18,7 @@ import cv2
 from stupid_cat.config import ConfigError, PreprocessConfig, load_config
 from stupid_cat.db import Database
 from stupid_cat.detector import CatDetector
-from stupid_cat.ingest import MultiCameraIngest
+from stupid_cat.ingest import MultiCameraIngest, rate_limited
 from stupid_cat.reid import Embedder, build_centroid_from_refs, fuse_embeddings, ref_quality_ok
 from stupid_cat.session import VisitSessionFSM
 
@@ -291,3 +291,89 @@ def test_build_centroid_rejects_all_blank(tmp_path: Path) -> None:
         cv2.imwrite(str(refs / f"b{i}.jpg"), np.zeros((40, 40, 3), dtype=np.uint8))
     centroid = build_centroid_from_refs(_FakeEmbedder(), refs, PreprocessConfig(), min_refs=5)
     assert centroid is None  # all uniform/blank -> skipped -> below min_refs
+
+
+def test_ref_quality_gate_robust_to_outlier_and_low_contrast() -> None:
+    # A single hot/dead pixel must NOT make a blank patch look textured
+    # (percentile range ignores the 1% tails).
+    hot_pixel_blank = np.zeros((40, 40, 3), dtype=np.uint8)
+    hot_pixel_blank[0, 0] = 255
+    assert ref_quality_ok(hot_pixel_blank) is False
+    # A genuinely low-contrast dark IR crop (p99-p1 ~ 8) must be KEPT.
+    low_contrast = np.full((40, 40, 3), 4, dtype=np.uint8)
+    low_contrast[8:32, 8:32] = 12
+    assert ref_quality_ok(low_contrast) is True
+
+
+# --- ingest survives mid-stream frame-shape change --------------------------
+
+
+def test_rate_limited_survives_frame_shape_change() -> None:
+    class _Varying:
+        camera_id = "cam1"
+
+        def frames(self):
+            yield np.zeros((480, 640, 3), dtype=np.uint8)   # 4:3 -> gray 320x240
+            yield np.zeros((1080, 1920, 3), dtype=np.uint8)  # 16:9 -> gray 320x180
+            yield np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # A reconnect that renegotiates aspect ratio must not crash motion_score's
+    # absdiff (would otherwise kill the camera reader permanently).
+    events = list(rate_limited(_Varying(), active_fps=1000.0, idle_fps=1000.0, motion_threshold=0.0))
+    assert len(events) >= 1
+
+
+# --- FSM robustness: callback errors / phantom visits -----------------------
+
+
+def test_end_visit_transitions_even_if_callback_raises() -> None:
+    fsm = VisitSessionFSM(
+        camera_ids=["cam1"], enter_overlap_sec=0.05, exit_no_cat_sec=0.05,
+        cooldown_sec=0.05, min_visit_sec=0.01,
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("callback failed")
+
+    fsm.on_visit_end = _boom
+    t = 0.0
+    for _ in range(4):
+        fsm.on_frame("cam1", qualified=True, timestamp=t)
+        t += 0.02
+    assert fsm.state == "active"
+
+    t += 0.2
+    with pytest.raises(RuntimeError):
+        fsm.on_frame("cam1", qualified=False, timestamp=t)
+    # Despite the raising callback, the FSM must not stay wedged in "active".
+    assert fsm.state in ("cooldown", "idle")
+    assert fsm.visit_id is None
+
+
+def test_no_phantom_visit_from_stale_qualified_after_cooldown() -> None:
+    starts: list[str] = []
+    fsm = VisitSessionFSM(
+        camera_ids=["cam1", "cam2"], enter_overlap_sec=0.05, exit_no_cat_sec=0.05,
+        cooldown_sec=0.05, min_visit_sec=0.01,
+    )
+    fsm.on_visit_start = starts.append
+    fsm.on_visit_end = lambda *_a, **_k: None
+
+    t = 0.0
+    for _ in range(4):  # a real visit, driven by cam1
+        fsm.on_frame("cam1", qualified=True, timestamp=t)
+        t += 0.02
+    assert len(starts) == 1
+
+    # cam1 goes silent while its last frame was "qualified"; end the visit.
+    t += 0.2
+    fsm.on_frame("cam2", qualified=False, timestamp=t)
+    assert fsm.state == "cooldown"
+
+    # Wait out cooldown; only cam2 sends no-cat frames. cam1's stale "qualified"
+    # must not accumulate a phantom second visit.
+    t += 0.1
+    for _ in range(15):
+        fsm.on_frame("cam2", qualified=False, timestamp=t)
+        t += 0.05
+    assert len(starts) == 1

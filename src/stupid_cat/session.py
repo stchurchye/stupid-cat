@@ -52,6 +52,10 @@ class VisitSessionFSM:
             self.state = "idle"
             self.enter_accumulator = 0.0
             self.cooldown_until = None
+            # Drop stale per-camera qualification from before the visit, else a
+            # camera that went silent while last seen as "qualified" keeps
+            # `any_qualified` True and accumulates a phantom entry.
+            self._last_frame_qualified = dict.fromkeys(self.camera_ids, False)
 
         self._last_frame_qualified[camera_id] = qualified
         if qualified:
@@ -118,22 +122,23 @@ class VisitSessionFSM:
         duration = max(0.0, timestamp - self.started_at)
         discard = duration < self.min_visit_sec
 
-        if self.on_visit_end:
-            self.on_visit_end(
-                self.visit_id,
-                self.started_at,
-                timestamp,
-                duration,
-                discard,
-            )
-
-        self.visit_id = None
-        self.started_at = None
-
-        if enter_cooldown:
-            self.state = "cooldown"
-            self.cooldown_until = timestamp + self.cooldown_sec
-        else:
-            self.state = "idle"
-
-        self.enter_accumulator = 0.0
+        # Always transition state even if the callback raises, or the FSM would
+        # wedge in "active" forever and never detect another visit.
+        try:
+            if self.on_visit_end:
+                self.on_visit_end(
+                    self.visit_id,
+                    self.started_at,
+                    timestamp,
+                    duration,
+                    discard,
+                )
+        finally:
+            self.visit_id = None
+            self.started_at = None
+            if enter_cooldown:
+                self.state = "cooldown"
+                self.cooldown_until = timestamp + self.cooldown_sec
+            else:
+                self.state = "idle"
+            self.enter_accumulator = 0.0

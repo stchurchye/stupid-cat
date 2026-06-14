@@ -63,6 +63,14 @@ def log_runtime_diagnostics(cfg) -> bool:
     except ImportError:
         logger.warning("torch not importable; inference unavailable (API-only mode is fine).")
 
+    model = cfg.inference.yolo_model
+    if model.endswith(".pt") and (("/" in model) or ("\\" in model)) and not Path(model).exists():
+        logger.warning(
+            "yolo_model '%s' does not exist; ultralytics will try to download on "
+            "first frame (fails offline). Place the weights or fix inference.yolo_model.",
+            model,
+        )
+
     if cfg.recorder.enabled and shutil.which("ffmpeg") is None:
         logger.warning(
             "ffmpeg not found on PATH; recordings written with the mp4v fallback "

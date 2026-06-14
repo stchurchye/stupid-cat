@@ -65,26 +65,37 @@ class RtspSource:
         self.url = url
         self.reconnect_delay_sec = reconnect_delay_sec
 
+    def _open(self) -> cv2.VideoCapture:
+        # OPEN/READ timeouts are open-only properties: they must be passed in the
+        # constructor params, NOT set() after opening (which is a no-op). This
+        # bounds the RTSP handshake so a half-dead host can't block the reader.
+        params: list[int] = []
+        for prop_name, value in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", 5000),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", 5000),
+        ):
+            prop = getattr(cv2, prop_name, None)
+            if prop is not None:
+                params += [int(prop), value]
+        if params:
+            try:
+                return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
+            except (cv2.error, TypeError):
+                pass
+        return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+
     def frames(self) -> Iterator[np.ndarray]:
         while True:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap = self._open()
             if not cap.isOpened():
                 logger.warning("RTSP open failed for %s, retry in %.0fs", self.camera_id, self.reconnect_delay_sec)
                 time.sleep(self.reconnect_delay_sec)
                 continue
-            # Keep only the freshest frame (process live video, not a backlog),
-            # and bound read blocking so a stalled stream returns periodically.
-            for prop_name, value in (
-                ("CAP_PROP_BUFFERSIZE", 1),
-                ("CAP_PROP_READ_TIMEOUT_MSEC", 5000),
-                ("CAP_PROP_OPEN_TIMEOUT_MSEC", 5000),
-            ):
-                prop = getattr(cv2, prop_name, None)
-                if prop is not None:
-                    try:
-                        cap.set(prop, value)
-                    except cv2.error:
-                        pass
+            # Keep only the freshest frame (process live video, not a backlog).
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except cv2.error:
+                pass
             logger.info("RTSP connected: %s", self.camera_id)
             try:
                 while True:
@@ -128,7 +139,13 @@ def rate_limited(
 
     for frame in source.frames():
         gray = _motion_gray(frame)
-        score = 0.0 if prev_gray is None else motion_score(prev_gray, gray)
+        # A reconnect can renegotiate a different resolution/aspect ratio, so the
+        # gray shape may change mid-stream; absdiff would raise on a mismatch.
+        # Treat a shape change as "no motion this frame" and re-baseline.
+        if prev_gray is None or prev_gray.shape != gray.shape:
+            score = 0.0
+        else:
+            score = motion_score(prev_gray, gray)
         prev_gray = gray
         active = score >= motion_threshold
         target_fps = active_fps if active else idle_fps
