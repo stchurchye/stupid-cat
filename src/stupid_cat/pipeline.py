@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -26,7 +27,6 @@ from stupid_cat.reid import (
     fuse_embeddings,
     load_all_centroids,
     match_cat,
-    max_centroid_similarity,
 )
 from stupid_cat.session import VisitSessionFSM
 
@@ -86,13 +86,23 @@ class Pipeline:
         self.embedder = embedder or Embedder(
             device=cfg.inference.device,
             backbone=cfg.inference.reid_backbone,
+            fp16=cfg.inference.fp16,
         )
         self.centroids = load_all_centroids(self._data_dir / "cats")
-        self.camera_weights = {c.id: c.weight for c in cfg.cameras}
-        self.roi_by_camera = {c.id: c.roi_polygon for c in cfg.cameras}
+        # Only enabled cameras drive ingest / the FSM exit set.
+        self._cameras = [c for c in cfg.cameras if c.enabled]
+        if not self._cameras:
+            raise ValueError("no enabled cameras")
+        self.camera_weights = {c.id: c.weight for c in self._cameras}
+        self.roi_by_camera = {c.id: c.roi_polygon for c in self._cameras}
+        self._stream_dims = {c.id: (c.stream_width, c.stream_height) for c in self._cameras}
+        # Cache of ROI polygons scaled to the actual decoded frame size, keyed by
+        # camera id -> (frame_w, frame_h, scaled_polygon). Lets a lower-res
+        # substream reuse a main-stream-calibrated ROI (spec §7.3).
+        self._roi_scaled: dict[str, tuple[int, int, list]] = {}
 
         self.fsm = VisitSessionFSM(
-            camera_ids=[c.id for c in cfg.cameras],
+            camera_ids=[c.id for c in self._cameras],
             enter_overlap_sec=cfg.session.enter_overlap_sec,
             exit_no_cat_sec=cfg.session.exit_no_cat_sec,
             cooldown_sec=cfg.session.cooldown_sec,
@@ -109,8 +119,10 @@ class Pipeline:
         self._camera_ids_seen: set[str] = set()
         self._visit_started_at: str | None = None
         self._best_correction_crop: np.ndarray | None = None
-        self._best_correction_score: float = -1.0
+        self._best_correction_area: float = -1.0
         self._last_frame_at: dict[str, str] = {}
+        self._record_this_visit = False
+        self._last_disk_warn_mono = 0.0
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -155,7 +167,7 @@ class Pipeline:
         with self._lock:
             last_frame_at = dict(self._last_frame_at)
         rows: list[dict[str, object]] = []
-        for cam in self.cfg.cameras:
+        for cam in self._cameras:
             last_iso = last_frame_at.get(cam.id)
             connected = False
             if last_iso is not None:
@@ -233,6 +245,27 @@ class Pipeline:
             self._ingest = None
             self._ingest_active = False
 
+    def _disk_ok(self) -> bool:
+        """True if free disk space is above recorder.min_free_mb (throttled warn)."""
+        min_free = self.cfg.recorder.min_free_mb * 1024 * 1024
+        if min_free <= 0:
+            return True
+        try:
+            free = shutil.disk_usage(self._data_dir).free
+        except OSError:
+            return True  # can't tell — don't block recording
+        if free >= min_free:
+            return True
+        now = _mono_now()
+        if now - self._last_disk_warn_mono > 60.0:
+            self._last_disk_warn_mono = now
+            logger.warning(
+                "low disk space (%.0f MB free < %d MB); skipping recording",
+                free / 1024 / 1024,
+                self.cfg.recorder.min_free_mb,
+            )
+        return False
+
     def _correction_crop_path(self, visit_id: str) -> Path:
         return self._data_dir / "correction_crops" / f"{visit_id}.jpg"
 
@@ -252,6 +285,28 @@ class Pipeline:
     def _delete_correction_crop(self, visit_id: str) -> None:
         self._correction_crop_path(visit_id).unlink(missing_ok=True)
 
+    def _roi_for_frame(self, camera_id: str, frame_w: int, frame_h: int) -> list:
+        """ROI polygon scaled from its calibration resolution to the actual frame.
+
+        ROIs are authored in the camera's ``stream_width``×``stream_height``; if the
+        decoded frame differs (e.g. a lower-res substream), scale so the overlap
+        test stays in one coordinate space (spec §7.3).
+        """
+        roi = self.roi_by_camera.get(camera_id, [])
+        if not roi:
+            return roi
+        sw, sh = self._stream_dims.get(camera_id, (frame_w, frame_h))
+        if sw <= 0 or sh <= 0 or (sw == frame_w and sh == frame_h):
+            return roi
+        cached = self._roi_scaled.get(camera_id)
+        if cached is not None and cached[0] == frame_w and cached[1] == frame_h:
+            return cached[2]
+        sx = frame_w / sw
+        sy = frame_h / sh
+        scaled = [[float(p[0]) * sx, float(p[1]) * sy] for p in roi]
+        self._roi_scaled[camera_id] = (frame_w, frame_h, scaled)
+        return scaled
+
     def _process_frame(self, event: FrameEvent) -> None:
         camera_id = event.camera_id
 
@@ -260,7 +315,8 @@ class Pipeline:
         primary = select_primary_bbox(boxes)
         qualified = False
         if primary is not None:
-            roi = self.roi_by_camera.get(camera_id, [])
+            h, w = frame.shape[:2]
+            roi = self._roi_for_frame(camera_id, w, h)
             overlap = bbox_roi_overlap_ratio(primary, roi)
             qualified = overlap >= self.cfg.session.roi_overlap_min
 
@@ -273,7 +329,7 @@ class Pipeline:
 
             self._camera_ids_seen.add(camera_id)
             if (
-                self.cfg.recorder.enabled
+                self._record_this_visit
                 and camera_id == self.cfg.recorder.primary_camera
                 and self.fsm.visit_id
             ):
@@ -291,14 +347,18 @@ class Pipeline:
 
             embedding = self.embedder.embed(crop)
 
-            score = max_centroid_similarity(embedding, self.centroids)
-            if score > self._best_correction_score:
-                self._best_correction_score = score
-                self._best_correction_crop = crop
-
             # True bbox area (width * height) so buffer eviction keeps the
             # largest crops as spec §8.6 intends (was short_side**2 before).
             bbox_area = max(0.0, primary[2] - primary[0]) * max(0.0, primary[3] - primary[1])
+
+            # Keep the largest, clearest crop as the visit's representative for the
+            # correction gallery — chosen by crop size, NOT by similarity to an
+            # existing centroid (which would bias corrections toward whatever the
+            # model already guessed, a confirmation-bias drift trap).
+            if bbox_area > self._best_correction_area:
+                self._best_correction_area = bbox_area
+                self._best_correction_crop = crop
+
             self._embedding_buffer.add(
                 EmbeddingRecord(
                     embedding=embedding,
@@ -317,7 +377,9 @@ class Pipeline:
         self._recording_path = None
         self._visit_started_at = _iso_now()
         self._best_correction_crop = None
-        self._best_correction_score = -1.0
+        self._best_correction_area = -1.0
+        # Decide once per visit whether to record (config + disk space).
+        self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
         # Persist the visit at START so a crash mid-visit leaves a recoverable
         # row instead of losing it entirely (finalized on next startup).
         try:
@@ -347,7 +409,7 @@ class Pipeline:
                 recording_path.unlink(missing_ok=True)
             self._embedding_buffer = None
             self._best_correction_crop = None
-            self._best_correction_score = -1.0
+            self._best_correction_area = -1.0
             self._delete_correction_crop(visit_id)
             # Row was created at visit start; drop it since the visit is discarded.
             try:
@@ -360,7 +422,7 @@ class Pipeline:
         if self._best_correction_crop is not None:
             self._save_correction_crop(visit_id, self._best_correction_crop)
         self._best_correction_crop = None
-        self._best_correction_score = -1.0
+        self._best_correction_area = -1.0
 
         embs, weights = [], []
         if self._embedding_buffer and len(self._embedding_buffer) > 0:
@@ -511,5 +573,5 @@ def build_pipeline(
 
     from stupid_cat.ingest import RtspSource
 
-    sources = [RtspSource(c.id, c.rtsp_url) for c in cfg.cameras]
+    sources = [RtspSource(c.id, c.rtsp_url) for c in cfg.cameras if c.enabled]
     return pipeline, sources

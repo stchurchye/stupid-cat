@@ -10,10 +10,25 @@ import threading
 from pathlib import Path
 
 import numpy as np
+import pytest
+import yaml
 
+from stupid_cat.config import ConfigError, load_config
 from stupid_cat.db import Database
+from stupid_cat.detector import CatDetector
 from stupid_cat.ingest import MultiCameraIngest
+from stupid_cat.reid import Embedder, fuse_embeddings
 from stupid_cat.session import VisitSessionFSM
+
+_REPO_CFG = Path(__file__).resolve().parents[1] / "config.yaml"
+
+
+def _write_cfg(tmp_path: Path, mutate) -> Path:
+    data = yaml.safe_load(_REPO_CFG.read_text(encoding="utf-8"))
+    mutate(data)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.dump(data), encoding="utf-8")
+    return path
 
 
 # --- FSM watchdog -----------------------------------------------------------
@@ -160,3 +175,52 @@ def test_ingest_emits_heartbeat_while_a_source_is_blocked() -> None:
     finally:
         release.set()
         ingest.stop()
+
+
+# --- FP16 (device-aware) ----------------------------------------------------
+
+
+def test_embedder_fp16_only_on_cuda() -> None:
+    assert Embedder(device="cpu", fp16=True)._use_half is False
+    assert Embedder(device="cuda:0", fp16=True)._use_half is True
+    assert Embedder(device="cuda:0", fp16=False)._use_half is False
+
+
+def test_detector_fp16_only_on_cuda() -> None:
+    from stupid_cat.config import InferenceConfig
+
+    assert CatDetector(InferenceConfig(device="cpu", fp16=True))._use_half is False
+    assert CatDetector(InferenceConfig(device="cuda:0", fp16=True))._use_half is True
+
+
+# --- weighted_median actually weights ---------------------------------------
+
+
+def test_weighted_median_respects_weights() -> None:
+    a = np.array([1.0, 0.0])
+    b = np.array([0.0, 1.0])
+    toward_a = fuse_embeddings([a, b], [3.0, 1.0], mode="weighted_median")
+    toward_b = fuse_embeddings([a, b], [1.0, 3.0], mode="weighted_median")
+    # The heavier-weighted embedding dominates the per-dimension median, so the
+    # fused direction leans toward it (the old int-rounding code ignored 0.5/1.5).
+    assert toward_a[0] > toward_a[1]
+    assert toward_b[1] > toward_b[0]
+
+
+# --- camera enabled flag ----------------------------------------------------
+
+
+def test_disabled_camera_excluded(tmp_path: Path) -> None:
+    cfg_path = _write_cfg(tmp_path, lambda d: d["cameras"][1].__setitem__("enabled", False))
+    cfg = load_config(cfg_path)
+    assert [c.id for c in cfg.cameras if c.enabled] == ["cam1"]
+
+
+def test_all_cameras_disabled_is_error(tmp_path: Path) -> None:
+    def _disable_all(d: dict) -> None:
+        for cam in d["cameras"]:
+            cam["enabled"] = False
+
+    cfg_path = _write_cfg(tmp_path, _disable_all)
+    with pytest.raises(ConfigError, match="at least one camera must be enabled"):
+        load_config(cfg_path)

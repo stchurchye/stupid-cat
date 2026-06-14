@@ -8,10 +8,13 @@ dependencies = [
   "numpy>=1.26",
   "opencv-python-headless>=4.9",
   "pyyaml>=6.0",
-  "torch>=2.2",
-  "torchvision>=0.17",
+  # Upper bounds keep production on a torch/torchvision generation whose CUDA
+  # wheels still ship Pascal (sm_61) kernels for the GTX 1060. See
+  # requirements-win-cuda.txt for the exact +cu121 pins used on the Windows box.
+  "torch>=2.2,<2.6",
+  "torchvision>=0.17,<0.21",
   "Pillow>=10.0",
-  "ultralytics>=8.3",
+  "ultralytics>=8.3,<9",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
 ]
@@ -20,9 +23,9 @@ dependencies = [
 dev = [
   "httpx>=0.27",
   "pytest>=8.0",
-  "torch>=2.2",
-  "torchvision>=0.17",
-  "ultralytics>=8.3",
+  "torch>=2.2,<2.6",
+  "torchvision>=0.17,<0.21",
+  "ultralytics>=8.3,<9",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
 ]

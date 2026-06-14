@@ -1,12 +1,27 @@
-# Install PyTorch with CUDA separately on Windows, e.g.:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-torch>=2.2
-torchvision>=0.17
-ultralytics>=8.3
+# Windows production deps for the GTX 1060 (Pascal, compute capability 6.1 / sm_61).
+#
+# Install with the CUDA 12.1 wheel index — these are the last torch/torchvision
+# wheels that comfortably ship sm_61 kernels. Newer torch (>=2.6, cu124/cu126+)
+# has begun dropping Pascal, which fails at runtime with:
+#     "no kernel image is available for execution on the device".
+# Pins are exact so a reinstall months from now can't silently pull a wheel that
+# no longer supports the 1060. The startup self-check (python -m stupid_cat ...)
+# logs torch.version.cuda + device capability and warns loudly on a mismatch.
+#
+# Usage:
+#   pip install -r requirements-win-cuda.txt
+#   pip install -e .            # (install_win.ps1 does both)
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+ultralytics>=8.3,<9
 opencv-python-headless>=4.9
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pyyaml>=6.0
-numpy>=1.26
+numpy>=1.26,<2.2
+Pillow>=10.0
 pytest>=8.0
 httpx>=0.27

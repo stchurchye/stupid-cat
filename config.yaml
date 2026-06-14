@@ -17,6 +17,7 @@ inference:
   similarity_threshold: 0.55
   fusion: "weighted_median"
   fusion_max_frames: 64
+  fp16: false               # half precision; only applied when device is cuda:*
 
 cats:
   min_refs: 5

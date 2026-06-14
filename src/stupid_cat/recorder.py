@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -33,6 +34,7 @@ class VisitRecorder:
         self._path: Path | None = None
         self._fourcc = "avc1"
         self._frames_written = 0
+        self._start_mono: float | None = None
 
     @property
     def frames_written(self) -> int:
@@ -45,6 +47,7 @@ class VisitRecorder:
         h, w = frame_bgr.shape[:2]
         self._writer, self._fourcc = _open_video_writer(self._path, self.fps, (w, h))
         self._frames_written = 0
+        self._start_mono = time.monotonic()
         self.write_frame(frame_bgr)
         return self._path
 
@@ -52,6 +55,10 @@ class VisitRecorder:
         if self._writer is None:
             return False
         if self._frames_written >= self._max_frames:
+            return False
+        # Wall-clock cap: a near-still cat throttles to idle fps, so a fixed frame
+        # budget could span minutes; stop once real elapsed time exceeds the limit.
+        if self._start_mono is not None and time.monotonic() - self._start_mono > self.max_seconds:
             return False
         self._writer.write(frame_bgr)
         self._frames_written += 1

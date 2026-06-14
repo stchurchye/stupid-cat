@@ -75,6 +75,12 @@ class RtspSource:
                 logger.warning("RTSP open failed for %s, retry in %.0fs", self.camera_id, self.reconnect_delay_sec)
                 time.sleep(self.reconnect_delay_sec)
                 continue
+            # Keep only the freshest frame so we process live video, not a
+            # growing backlog, when downstream is slower than the camera.
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except cv2.error:
+                pass
             logger.info("RTSP connected: %s", self.camera_id)
             try:
                 while True:
@@ -93,6 +99,17 @@ def motion_score(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:
     return float(np.mean(diff))
 
 
+def _motion_gray(frame: np.ndarray) -> np.ndarray:
+    """Downsampled grayscale for motion gating — cheap on full-res IR frames."""
+    h, w = frame.shape[:2]
+    if w > 320:
+        scale = 320.0 / w
+        frame = cv2.resize(
+            frame, (320, max(1, int(h * scale))), interpolation=cv2.INTER_AREA
+        )
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
 def rate_limited(
     source: FrameSource,
     *,
@@ -106,7 +123,7 @@ def rate_limited(
     active = False
 
     for frame in source.frames():
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = _motion_gray(frame)
         score = 0.0 if prev_gray is None else motion_score(prev_gray, gray)
         prev_gray = gray
         active = score >= motion_threshold

@@ -40,6 +40,10 @@ def fast_pipeline(tmp_path: Path) -> Pipeline:
     data["session"]["cooldown_sec"] = 0.05
     data["session"]["min_visit_sec"] = 0.01
     data["cameras"] = [data["cameras"][0]]
+    # Test frames are 640x480; match the camera's calibration resolution so the
+    # ROI (authored in stream coords) maps 1:1 onto the frame (spec §7.3).
+    data["cameras"][0]["stream_width"] = 640
+    data["cameras"][0]["stream_height"] = 480
     cfg_path.write_text(yaml.dump(data), encoding="utf-8")
 
     cfg = load_config(cfg_path)
@@ -134,6 +138,16 @@ def test_recover_orphan_visits_on_construction(fast_pipeline: Pipeline, tmp_path
     fast_pipeline._recover_orphan_visits()
     row = fast_pipeline.db.get_visit(orphan)
     assert row["ended_at"] is not None
+
+
+def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
+    # Fixture calibrates the camera at 640x480.
+    roi_full = fast_pipeline._roi_for_frame("cam1", 640, 480)
+    roi_half = fast_pipeline._roi_for_frame("cam1", 320, 240)
+    # At the calibration resolution the ROI is unchanged; at half resolution
+    # every coordinate is halved (spec §7.3 substream support).
+    assert roi_half[0][0] == roi_full[0][0] / 2
+    assert roi_half[2][1] == roi_full[2][1] / 2
 
 
 def test_set_centroid_is_copy_on_write(fast_pipeline: Pipeline) -> None:
