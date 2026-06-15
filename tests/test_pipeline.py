@@ -320,6 +320,37 @@ def test_multi_cat_debounced_against_single_frame_split(fast_pipeline: Pipeline)
     assert visit["multi_cat"] is False
 
 
+def test_multi_cat_intermittent_splits_not_flagged(fast_pipeline: Pipeline) -> None:
+    # Two boxes appear only on alternating frames (never _MULTI_CAT_MIN_FRAMES in a
+    # row), so the streak never confirms and it stays single-cat. The old frame-tally
+    # logic summed these scattered frames past the threshold and mis-flagged it.
+    class _Intermittent:
+        in_roi = True
+        calls = 0
+
+        def detect(self, frame, camera_id):
+            if not self.in_roi:
+                return []
+            self.calls += 1
+            two = [(150.0, 150.0, 250.0, 250.0), (300.0, 150.0, 400.0, 250.0)]
+            one = [(150.0, 150.0, 250.0, 250.0)]
+            return two if self.calls % 2 == 0 else one
+
+    fast_pipeline.detector = _Intermittent()
+    t = 0.0
+    for _ in range(16):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    fast_pipeline.detector.in_roi = False
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+
+    visit = fast_pipeline.db.list_visits(only_ended=True)[0]
+    assert visit["max_cats"] == 1
+    assert visit["multi_cat"] is False
+
+
 def test_digging_samples_only_while_cat_present(fast_pipeline: Pipeline) -> None:
     t = 0.0
     for _ in range(8):
