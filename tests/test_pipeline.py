@@ -182,7 +182,9 @@ def test_roi_normalized_is_resolution_independent(fast_pipeline: Pipeline) -> No
 
 
 def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
-    # Fixture calibrates the camera at 640x480.
+    # Explicit PIXEL ROI (the default config now ships a normalized full-frame ROI);
+    # fixture calibrates the camera at 640x480.
+    fast_pipeline.roi_by_camera["cam1"] = [[100, 80], [500, 80], [500, 400], [100, 400]]
     roi_full = fast_pipeline._roi_for_frame("cam1", 640, 480)
     roi_half = fast_pipeline._roi_for_frame("cam1", 320, 240)
     # At the calibration resolution the ROI is unchanged; at half resolution
