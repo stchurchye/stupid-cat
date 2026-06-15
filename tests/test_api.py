@@ -218,7 +218,13 @@ def test_api_key_auth_gate(tmp_path: Path) -> None:
     client = TestClient(create_app(pipeline, db))
 
     assert client.get("/api/v1/health").status_code == 200  # health stays public
-    assert client.get("/api/v1/visits").status_code == 401  # no key -> blocked
+    assert client.get("/api/v1/visits").status_code == 401  # API path -> 401, not redirect
+    # A page navigation without the key is redirected (303) to /login, not 401.
+    page = client.get("/", headers={"accept": "text/html"}, follow_redirects=False)
+    assert page.status_code == 303
+    assert page.headers["location"] == "/login"
+    # OPTIONS preflight is never gated.
+    assert client.options("/api/v1/visits").status_code != 401
     assert client.get("/api/v1/visits", headers={"X-API-Key": "secret"}).status_code == 200
     assert client.post("/api/v1/login", json={"key": "wrong"}).status_code == 401
     assert client.post("/api/v1/login", json={"key": "secret"}).status_code == 200

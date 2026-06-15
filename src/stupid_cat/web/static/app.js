@@ -31,6 +31,10 @@ function formatDuration(sec) {
 
 async function getJSON(url) {
   const res = await fetch(url);
+  if (res.status === 401) {
+    window.location.href = "/login"; // session expired / key rotated -> re-auth
+    throw new Error("unauthorized");
+  }
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json();
 }
@@ -271,6 +275,10 @@ async function submitChange(select, url, body, okMsg) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (res.status === 401) {
+      window.location.href = "/login";
+      return;
+    }
     if (!res.ok) {
       const detail = await res.json().catch(() => ({}));
       throw new Error(detail.detail || `HTTP ${res.status}`);
