@@ -29,18 +29,16 @@ cats:
     - { id: cat5, name: "猫5" }
 
 cameras:
+  # 整盆基本占满画面,所以默认 ROI = 全画面(归一化 0~1,与分辨率无关)。
+  # 想只圈一部分砂区就改成更小的 0~1 多边形,例如 [[0.14,0.13],[0.88,0.13],[0.88,0.95],[0.14,0.95]]。
   - id: cam1
     rtsp_url: "rtsp://user:pass@192.168.1.101:554/stream1"
     weight: 0.5
-    stream_width: 1920
-    stream_height: 1080
-    roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+    roi_polygon: [[0, 0], [1, 0], [1, 1], [0, 1]]
   - id: cam2
     rtsp_url: "rtsp://user:pass@192.168.1.102:554/stream1"
     weight: 0.5
-    stream_width: 1920
-    stream_height: 1080
-    roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
+    roi_polygon: [[0, 0], [1, 0], [1, 1], [0, 1]]
 
 session:
   roi_overlap_min: 0.25
