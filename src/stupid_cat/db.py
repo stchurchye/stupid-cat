@@ -466,13 +466,16 @@ class Database:
     def clear_recording_paths(self, visit_ids: list[str]) -> None:
         if not visit_ids:
             return
-        conn = self._connection()
-        placeholders = ",".join("?" * len(visit_ids))
-        conn.execute(
-            f"UPDATE visits SET recording_path = NULL WHERE id IN ({placeholders})",
-            visit_ids,
-        )
-        conn.commit()
+        # Must hold the lock like every other writer: in-process retention calls
+        # this on the pipeline thread while API threads use the same connection.
+        with self._lock:
+            conn = self._connection()
+            placeholders = ",".join("?" * len(visit_ids))
+            conn.execute(
+                f"UPDATE visits SET recording_path = NULL WHERE id IN ({placeholders})",
+                visit_ids,
+            )
+            conn.commit()
 
     @staticmethod
     def _row_to_visit(row: sqlite3.Row) -> dict[str, Any]:

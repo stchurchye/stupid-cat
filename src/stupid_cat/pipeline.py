@@ -169,7 +169,9 @@ class Pipeline:
         self._preview_ts: dict[str, float] = {}
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
-        self._last_retention_mono = 0.0
+        # Seed to "now" so the first retention pass is one interval away, not on the
+        # first frame (which would race the startup recover-reencode over old clips).
+        self._last_retention_mono = _mono_now()
         # Optional MQTT alerting (no-op unless mqtt.enabled). Started in run().
         self.mqtt = MqttPublisher(cfg.mqtt)
         self._mqtt_streak_alerted = False
@@ -181,9 +183,11 @@ class Pipeline:
         self._visit_active = threading.Event()
         self._last_qualified_iso: str | None = None
         # Multi-cat detection (debounced): peak in-ROI count, recorded only while a
-        # >=2-cat streak is sustained; _multi_cat_streak is the current run length.
+        # >=2-cat streak is sustained. _multi_cat_streak is the current per-camera
+        # consecutive-run length; _cross_cam_streak the disjoint-camera concurrency run.
         self._peak_in_roi = 0
-        self._multi_cat_streak = 0
+        self._multi_cat_streak: dict[str, int] = {}
+        self._cross_cam_streak = 0
         # Per-camera last-qualified time (mono), for cross-camera multi-cat when
         # cameras don't overlap.
         self._cam_last_qualified: dict[str, float] = {}
@@ -510,11 +514,14 @@ class Pipeline:
         if not rec.is_dir():
             return
         removed: list[str] = []
+        # Never touch in-flight re-encode temps ('<id>.browser.mp4').
+        def _clips() -> list[Path]:
+            return [p for p in rec.glob("*.mp4") if not p.name.endswith(".browser.mp4")]
 
         days = self.cfg.recorder.retention_days
         if days > 0:
             cutoff = time.time() - days * 86400
-            for p in list(rec.glob("*.mp4")):
+            for p in _clips():
                 try:
                     if p.stat().st_mtime < cutoff:
                         p.unlink()
@@ -530,7 +537,7 @@ class Pipeline:
                 free = min_free  # can't tell -> skip free-space rotation
             if free < min_free:
                 # Oldest first; delete until back above the threshold.
-                clips = sorted(rec.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+                clips = sorted(_clips(), key=lambda p: p.stat().st_mtime)
                 for p in clips:
                     if free >= min_free:
                         break
@@ -642,16 +649,24 @@ class Pipeline:
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
             visit_active = self.fsm.state == "active"
             visit_id = self.fsm.visit_id
-            # Multi-cat: only trust the peak count once >=2 cats have been in-ROI
-            # for _MULTI_CAT_MIN_FRAMES CONSECUTIVE frames. Tying the peak to a
-            # sustained streak (rather than tracking peak and a separate frame
-            # tally independently) stops a single YOLO box-split frame from
-            # inflating the peak and mislabelling a lone cat as multi-cat.
+            # Multi-cat: confirm with a sustained >=2 streak before trusting the
+            # peak (debounces single-frame YOLO box splits). The same-camera streak
+            # is tracked PER CAMERA, because ingest interleaves both cameras' frames
+            # into one stream — a global counter would be reset by the other
+            # camera's <2-cat frames and never confirm a real two-cat visit one
+            # camera sees fully.
             if visit_active:
-                effective_count = in_roi_count
+                if in_roi_count >= 2:
+                    s = self._multi_cat_streak.get(camera_id, 0) + 1
+                    self._multi_cat_streak[camera_id] = s
+                    if s >= _MULTI_CAT_MIN_FRAMES:
+                        self._peak_in_roi = max(self._peak_in_roi, in_roi_count)
+                else:
+                    self._multi_cat_streak[camera_id] = 0
                 if not self.cfg.session.cameras_overlap:
                     # Disjoint cameras: a cat present in N distinct views at once is
-                    # N cats, so fold concurrent-camera occupancy into the count.
+                    # N cats. This concurrency is global (across cameras), so it
+                    # uses its own streak over the interleaved stream.
                     if qualified:
                         self._cam_last_qualified[camera_id] = event.timestamp
                     concurrent = sum(
@@ -659,13 +674,12 @@ class Pipeline:
                         for ts in self._cam_last_qualified.values()
                         if event.timestamp - ts <= _CROSS_CAM_WINDOW_SEC
                     )
-                    effective_count = max(in_roi_count, concurrent)
-                if effective_count >= 2:
-                    self._multi_cat_streak += 1
-                    if self._multi_cat_streak >= _MULTI_CAT_MIN_FRAMES:
-                        self._peak_in_roi = max(self._peak_in_roi, effective_count)
-                else:
-                    self._multi_cat_streak = 0
+                    if concurrent >= 2:
+                        self._cross_cam_streak += 1
+                        if self._cross_cam_streak >= _MULTI_CAT_MIN_FRAMES:
+                            self._peak_in_roi = max(self._peak_in_roi, concurrent)
+                    else:
+                        self._cross_cam_streak = 0
             # Digging signal for pee/poop (spec §12): frame-diff motion WITHIN the
             # litter ROI, sampled only while the cat is present (qualified) so the
             # empty post-departure tail can't dilute the late-phase digging mean.
@@ -758,7 +772,8 @@ class Pipeline:
         # frame, duration still reflects presence instead of the exit timeout.
         self._last_qualified_iso = self._visit_started_at
         self._peak_in_roi = 0
-        self._multi_cat_streak = 0
+        self._multi_cat_streak = {}
+        self._cross_cam_streak = 0
         self._cam_last_qualified = {}
         self._motion_samples = []
         self._digging_prev_gray = None
