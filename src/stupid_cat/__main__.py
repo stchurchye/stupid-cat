@@ -4,10 +4,79 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 from pathlib import Path
 
 from stupid_cat.pipeline import build_pipeline
+
+logger = logging.getLogger("stupid_cat")
+
+
+def log_runtime_diagnostics(cfg) -> bool:
+    """Surface device / dependency problems at startup instead of at 3am.
+
+    On the GTX 1060 (Pascal, sm_61) a torch upgrade can keep ``cuda.is_available``
+    True yet ship no sm_61 kernels, which only fails when the first real op runs.
+    We run a tiny CUDA op to flush that out, and warn if ffmpeg is missing.
+
+    Returns False if the configured CUDA device is unusable, so the caller can
+    abort instead of entering a frame-by-frame crash/skip loop.
+    """
+    ok = True
+    try:
+        import torch
+
+        cuda_ok = torch.cuda.is_available()
+        logger.info("torch %s (cuda build %s), cuda_available=%s",
+                    torch.__version__, torch.version.cuda, cuda_ok)
+        device = str(cfg.inference.device)
+        if device.startswith("cuda"):
+            idx = 0
+            if ":" in device:
+                try:
+                    idx = int(device.split(":", 1)[1])
+                except ValueError:
+                    idx = 0
+            if not cuda_ok:
+                logger.error(
+                    "config requests device=%s but CUDA is unavailable; aborting. "
+                    "Check the torch+cuXXX install (requirements-win-cuda.txt).", device
+                )
+                ok = False
+            else:
+                try:
+                    cap = torch.cuda.get_device_capability(idx)
+                    name = torch.cuda.get_device_name(idx)
+                    logger.info("CUDA device %d: %s, compute capability %d.%d", idx, name, *cap)
+                    _ = (torch.zeros(8, device=device) + 1).sum().item()
+                    logger.info("CUDA smoke test passed (sm_%d%d kernels present)", *cap)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "CUDA smoke test FAILED on %s — this torch build likely lacks "
+                        "Pascal (sm_61) kernels. Reinstall from requirements-win-cuda.txt "
+                        "(torch==2.4.1+cu121). Aborting.", device
+                    )
+                    ok = False
+        if cfg.inference.fp16 and not device.startswith("cuda"):
+            logger.warning("inference.fp16 is set but device=%s is not CUDA; FP16 ignored.", device)
+    except ImportError:
+        logger.warning("torch not importable; inference unavailable (API-only mode is fine).")
+
+    model = cfg.inference.yolo_model
+    if model.endswith(".pt") and (("/" in model) or ("\\" in model)) and not Path(model).exists():
+        logger.warning(
+            "yolo_model '%s' does not exist; ultralytics will try to download on "
+            "first frame (fails offline). Place the weights or fix inference.yolo_model.",
+            model,
+        )
+
+    if cfg.recorder.enabled and shutil.which("ffmpeg") is None:
+        logger.warning(
+            "ffmpeg not found on PATH; recordings written with the mp4v fallback "
+            "may not play in the browser. Install ffmpeg for H.264 re-encode."
+        )
+    return ok
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -48,6 +117,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         local_config_path=local,
         video_path=args.video,
     )
+    if not log_runtime_diagnostics(pipeline.cfg):
+        print("Aborting: GPU/runtime self-check failed (see logs).", file=sys.stderr)
+        return 1
     pipeline.start_background(sources)
 
     print("Pipeline running. Ctrl+C to stop.")
@@ -78,6 +150,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         video_path=None if args.api_only else args.video,
     )
     if not args.api_only:
+        if not log_runtime_diagnostics(pipeline.cfg):
+            print("Aborting: GPU/runtime self-check failed (see logs).", file=sys.stderr)
+            return 1
         if pipeline.cfg.service.pause_on_start:
             pipeline.pause()
         pipeline.start_background(sources)
