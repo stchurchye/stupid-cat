@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 import socket
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 
 SUBNET = "192.168.31"
 HIK_PORTS = [80, 443, 554, 8000, 8080]

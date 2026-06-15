@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Light install: the heavy torch/ultralytics deps are imported lazily, so
+      # CI runs the full non-GPU suite without them (GPU-marked tests skip).
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy "opencv-python-headless>=4.9" pyyaml fastapi "uvicorn[standard]" \
+            httpx pydantic pytest pytest-cov ruff mypy
+          pip install -e . --no-deps
+      - name: Lint (ruff)
+        run: ruff check src tests scripts
+      - name: Tests
+        run: pytest -m "not gpu" --cov=stupid_cat --cov-report=term-missing
+      - name: Type-check (mypy, non-blocking)
+        run: mypy --ignore-missing-imports src/stupid_cat
+        continue-on-error: true
