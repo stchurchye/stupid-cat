@@ -96,6 +96,7 @@ async function loadVisits() {
   const tbody = document.querySelector("#visits tbody");
   tbody.innerHTML = "";
   const selects = [];
+  const wasteSelects = [];
 
   if (visits.length === 0) {
     const tr = document.createElement("tr");
@@ -129,7 +130,16 @@ async function loadVisits() {
     }
     tr.appendChild(catTd);
 
-    tr.appendChild(el("td", formatDuration(v.duration_sec)));
+    const durTd = el("td");
+    durTd.appendChild(el("span", formatDuration(v.duration_sec)));
+    const wasteLabel = { poop: "💩 屎", pee: "💧 尿" }[v.waste_type];
+    if (wasteLabel) {
+      const wb = el("span", wasteLabel, "waste-badge");
+      wb.style.marginLeft = "6px";
+      wb.style.fontSize = "0.85em";
+      durTd.appendChild(wb);
+    }
+    tr.appendChild(durTd);
 
     tr.appendChild(el("td", formatCameraIds(v.camera_ids, cameraMap), "conf-value"));
 
@@ -168,10 +178,22 @@ async function loadVisits() {
     sel.className = "cat-select";
     sel.dataset.visitId = v.id;
     corrTd.appendChild(sel);
+
+    const wsel = document.createElement("select");
+    wsel.className = "waste-select";
+    wsel.dataset.visitId = v.id;
+    for (const [val, label] of [["", "屎/尿…"], ["poop", "💩 屎"], ["pee", "💧 尿"], ["unknown", "未知"]]) {
+      const opt = el("option", label);
+      opt.value = val;
+      wsel.appendChild(opt);
+    }
+    wsel.value = v.waste_type === "poop" || v.waste_type === "pee" ? v.waste_type : "";
+    corrTd.appendChild(wsel);
     tr.appendChild(corrTd);
 
     tbody.appendChild(tr);
     selects.push(sel);
+    wasteSelects.push(wsel);
   }
 
   await loadCats(selects);
@@ -182,6 +204,17 @@ async function loadVisits() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cat_id: sel.value }),
+      });
+      loadVisits();
+    });
+  });
+  wasteSelects.forEach((wsel) => {
+    wsel.addEventListener("change", async () => {
+      if (!wsel.value) return;
+      await fetch(`/api/v1/visits/${wsel.dataset.visitId}/waste`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ waste_type: wsel.value }),
       });
       loadVisits();
     });

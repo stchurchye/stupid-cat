@@ -245,6 +245,18 @@ def test_correct_visit_appends_dual_camera_refs(fast_pipeline: Pipeline, tmp_pat
     assert (refs_dir / f"{visit_id}_cam2.jpg").exists()
 
 
+def test_classify_waste_heuristic(fast_pipeline: Pipeline) -> None:
+    w = fast_pipeline.cfg.waste
+    w.enabled = True
+    # poop: long visit + heavy late digging
+    assert fast_pipeline._classify_waste(w.poop_min_duration_sec + 10, w.dig_motion_threshold + 5)[0] == "poop"
+    # pee: short visit + little digging
+    assert fast_pipeline._classify_waste(w.pee_max_duration_sec - 10, w.dig_motion_threshold - 5)[0] == "pee"
+    # ambiguous combinations -> unknown
+    assert fast_pipeline._classify_waste(w.poop_min_duration_sec + 10, 0)[0] == "unknown"
+    assert fast_pipeline._classify_waste(w.pee_max_duration_sec - 10, w.dig_motion_threshold + 50)[0] == "unknown"
+
+
 def test_multi_cat_visit_is_flagged(fast_pipeline: Pipeline) -> None:
     class _TwoCatDetector:
         in_roi = True

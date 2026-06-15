@@ -16,7 +16,14 @@ from stupid_cat.config import AppConfig, load_config
 from stupid_cat.db import Database
 from stupid_cat.detector import CatDetector, select_primary_bbox
 from stupid_cat.geometry import bbox_roi_overlap_ratio
-from stupid_cat.ingest import FrameEvent, FrameSource, MultiCameraIngest, VideoFileSource
+from stupid_cat.ingest import (
+    FrameEvent,
+    FrameSource,
+    MultiCameraIngest,
+    VideoFileSource,
+    _motion_gray,
+    motion_score,
+)
 from stupid_cat.preprocess import preprocess_frame
 from stupid_cat.recorder import VisitRecorder, reencode_for_browser, visit_recording_filename
 from stupid_cat.reid import (
@@ -138,6 +145,11 @@ class Pipeline:
         self._visit_active = threading.Event()
         self._last_qualified_iso: str | None = None
         self._max_cats_seen = 0  # most cats simultaneously in-ROI during the visit
+        # Per-visit digging signal (primary camera): (monotonic_ts, motion) samples,
+        # used to classify pee vs poop by late-phase frame-difference (spec §12).
+        self._motion_samples: list[tuple[float, float]] = []
+        self._digging_prev_gray: np.ndarray | None = None
+        self._late_fraction = 0.4  # fraction of the visit treated as "late phase"
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -505,6 +517,15 @@ class Pipeline:
             visit_id = self.fsm.visit_id
             if visit_active and in_roi_count > self._max_cats_seen:
                 self._max_cats_seen = in_roi_count  # flag multi-cat visits
+            # Digging signal for pee/poop classification: frame-to-frame motion on
+            # the primary camera while the visit is active (spec §12).
+            if visit_active and camera_id == self.cfg.recorder.primary_camera:
+                gray = _motion_gray(frame)
+                if self._digging_prev_gray is not None and self._digging_prev_gray.shape == gray.shape:
+                    self._motion_samples.append((event.timestamp, motion_score(self._digging_prev_gray, gray)))
+                    if len(self._motion_samples) > 6000:
+                        self._motion_samples = self._motion_samples[-4000:]
+                self._digging_prev_gray = gray
             embed_work = visit_active and primary is not None
 
         with self._preview_lock:
@@ -583,6 +604,8 @@ class Pipeline:
         self._best_correction_areas = {}
         self._last_qualified_iso = None
         self._max_cats_seen = 0
+        self._motion_samples = []
+        self._digging_prev_gray = None
         self._visit_active.set()  # ingest now records at full fps until visit end
         # Decide once per visit whether to record (config + disk space).
         self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
@@ -598,6 +621,31 @@ class Pipeline:
         except Exception:  # noqa: BLE001 - never let a DB hiccup kill the FSM
             logger.exception("failed to persist visit start %s", visit_id)
         logger.info("visit started %s", visit_id)
+
+    def _late_digging_motion(self) -> float:
+        """Mean frame-difference motion over the late phase of the visit — a proxy
+        for litter digging (covering) that tends to follow a poop."""
+        samples = self._motion_samples
+        if len(samples) < 2:
+            return 0.0
+        t0, t1 = samples[0][0], samples[-1][0]
+        span = t1 - t0
+        if span <= 0:
+            return float(np.mean([m for _, m in samples]))
+        cutoff = t0 + span * (1.0 - self._late_fraction)
+        late = [m for ts, m in samples if ts >= cutoff]
+        return float(np.mean(late)) if late else float(samples[-1][1])
+
+    def _classify_waste(self, duration_sec: int, late_motion: float) -> tuple[str, float]:
+        """Heuristic pee/poop/unknown from duration + late digging (spec §12).
+        Non-medical; thresholds are configurable and meant for field tuning."""
+        w = self.cfg.waste
+        high_dig = late_motion >= w.dig_motion_threshold
+        if duration_sec >= w.poop_min_duration_sec and high_dig:
+            return "poop", 0.7
+        if duration_sec <= w.pee_max_duration_sec and not high_dig:
+            return "pee", 0.6
+        return "unknown", 0.0
 
     def _on_visit_end(
         self,
@@ -685,6 +733,14 @@ class Pipeline:
             logger.info("visit %s is multi-cat (%d); forcing cat_id=unknown", visit_id, max_cats)
             cat_id, confidence = "unknown", 0.0
 
+        # Pee/poop heuristic — only for a single-cat visit (a mixed visit's
+        # duration/digging belong to two cats).
+        waste_type, waste_confidence = "unknown", 0.0
+        if self.cfg.waste.enabled and max_cats < 2:
+            waste_type, waste_confidence = self._classify_waste(
+                duration_sec, self._late_digging_motion()
+            )
+
         def _finalize() -> None:
             self.db.end_visit(
                 visit_id,
@@ -696,6 +752,8 @@ class Pipeline:
                 camera_ids=camera_ids,
                 recording_path=str(recording_path) if recording_path else None,
                 max_cats=max_cats,
+                waste_type=waste_type,
+                waste_confidence=waste_confidence,
             )
 
         # The row was created at visit start; if it is somehow missing (start

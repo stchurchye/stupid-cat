@@ -165,6 +165,20 @@ def test_max_cats_migration_on_pre_existing_db(tmp_path: Path) -> None:
     db.close()
 
 
+def test_set_waste_type(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-15T09:02:00+08:00",
+                 duration_sec=120, confidence=0.5)
+    assert db.get_visit(vid)["waste_type"] == "unknown"
+    db.set_waste_type(vid, "poop")
+    row = db.get_visit(vid)
+    assert row["waste_type"] == "poop"
+    assert row["waste_confidence"] == 1.0
+    db.close()
+
+
 def test_delete_visit_removes_row_and_corrections(tmp_path: Path) -> None:
     db = Database(tmp_path / "t.db")
     db.init_schema()
