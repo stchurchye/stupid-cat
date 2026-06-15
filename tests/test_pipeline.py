@@ -269,6 +269,37 @@ def test_multi_cat_visit_is_flagged(fast_pipeline: Pipeline) -> None:
     assert visit["multi_cat"] is True
 
 
+def test_multi_cat_forces_unknown_identity(fast_pipeline: Pipeline) -> None:
+    # A matching centroid is present, so a single cat WOULD be identified; a
+    # multi-cat visit must still be forced to unknown (don't guess a blend).
+    centroid = np.zeros(1280, dtype=np.float32)
+    centroid[0] = 1.0  # matches FakeEmbedder's output
+    fast_pipeline.centroids = {"mimi": centroid}
+
+    class _TwoCatDetector:
+        in_roi = True
+
+        def detect(self, frame, camera_id):
+            if not self.in_roi:
+                return []
+            return [(150.0, 150.0, 250.0, 250.0), (300.0, 150.0, 400.0, 250.0)]
+
+    fast_pipeline.detector = _TwoCatDetector()
+    t = 0.0
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    fast_pipeline.detector.in_roi = False
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+
+    visit = fast_pipeline.db.list_visits(only_ended=True)[0]
+    assert visit["multi_cat"] is True
+    assert visit["cat_id"] == "unknown"  # forced despite the matching centroid
+    assert visit["confidence"] == 0.0
+
+
 def test_visit_active_flag_tracks_visit(fast_pipeline: Pipeline) -> None:
     assert not fast_pipeline._visit_active.is_set()
     t = 0.0

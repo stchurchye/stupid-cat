@@ -678,6 +678,12 @@ class Pipeline:
         duration_sec = _duration_seconds_wall(started_at, ended_at)
         camera_ids = sorted(self._camera_ids_seen)
         max_cats = max(1, self._max_cats_seen)
+        if max_cats >= 2 and cat_id != "unknown":
+            # Two cats shared the box: the fused embedding mixes them, so don't
+            # claim an identity — record unknown (the max_cats/multi_cat flag and
+            # the saved crop still let the user correct it manually).
+            logger.info("visit %s is multi-cat (%d); forcing cat_id=unknown", visit_id, max_cats)
+            cat_id, confidence = "unknown", 0.0
 
         def _finalize() -> None:
             self.db.end_visit(
