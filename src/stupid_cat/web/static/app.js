@@ -119,6 +119,14 @@ async function loadVisits() {
       `cat-label${v.cat_id === "unknown" ? " unknown" : ""}`
     );
     catTd.appendChild(catLabel);
+    if (v.multi_cat) {
+      const badge = el("span", `👥 ${v.max_cats || 2}`, "multi-cat-badge");
+      badge.title = "本次有多只猫同时在盆里,身份识别不可靠";
+      badge.style.marginLeft = "6px";
+      badge.style.color = "#c2410c";
+      badge.style.fontSize = "0.85em";
+      catTd.appendChild(badge);
+    }
     tr.appendChild(catTd);
 
     tr.appendChild(el("td", formatDuration(v.duration_sec)));

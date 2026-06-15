@@ -117,6 +117,54 @@ def test_list_visits_time_filter_is_offset_aware(tmp_path: Path) -> None:
     db.close()
 
 
+def test_max_cats_persisted_and_multi_cat_flag(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00",
+                 duration_sec=300, confidence=0.0, max_cats=2)
+    row = db.get_visit(vid)
+    assert row["max_cats"] == 2
+    assert row["multi_cat"] is True
+
+    vid2 = db.create_visit(cat_id="mimi", started_at="2026-06-15T10:00:00+08:00")
+    db.end_visit(vid2, cat_id="mimi", ended_at="2026-06-15T10:01:00+08:00",
+                 duration_sec=60, confidence=0.5)
+    row2 = db.get_visit(vid2)
+    assert row2["max_cats"] == 1
+    assert row2["multi_cat"] is False
+    db.close()
+
+
+def test_max_cats_migration_on_pre_existing_db(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE visits (id TEXT PRIMARY KEY, cat_id TEXT NOT NULL, "
+        "started_at TEXT NOT NULL, ended_at TEXT, duration_sec INTEGER, "
+        "confidence REAL NOT NULL DEFAULT 0, waste_type TEXT NOT NULL DEFAULT 'unknown', "
+        "waste_confidence REAL NOT NULL DEFAULT 0, frames_used INTEGER NOT NULL DEFAULT 0, "
+        "camera_ids TEXT NOT NULL DEFAULT '[]', recording_path TEXT, "
+        "corrected INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO visits (id, cat_id, started_at, ended_at, duration_sec, created_at) "
+        "VALUES ('v1','unknown','2026-06-15T09:00:00+08:00','2026-06-15T09:01:00+08:00',60,"
+        "'2026-06-15T01:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    db.init_schema()  # must ALTER the pre-existing table to add max_cats
+    row = db.get_visit("v1")
+    assert row["max_cats"] == 1  # default backfill
+    assert row["multi_cat"] is False
+    db.close()
+
+
 def test_delete_visit_removes_row_and_corrections(tmp_path: Path) -> None:
     db = Database(tmp_path / "t.db")
     db.init_schema()
