@@ -54,3 +54,26 @@ def test_recorder_wall_clock_cap_stops_writing(tmp_path: Path, monkeypatch) -> N
     clock[0] = 1031.0  # 31s elapsed -> past max_seconds
     assert recorder.write_frame(frame) is False
     recorder.stop(reencode=False)
+
+
+def test_replace_with_retry_succeeds(tmp_path) -> None:
+    from stupid_cat.recorder import _replace_with_retry
+
+    src = tmp_path / "a.tmp"
+    src.write_bytes(b"x")
+    dst = tmp_path / "b.mp4"
+    assert _replace_with_retry(src, dst, attempts=2, delay=0) is True
+    assert dst.read_bytes() == b"x"
+    assert not src.exists()
+
+
+def test_replace_with_retry_gives_up_and_cleans_temp(tmp_path) -> None:
+    from stupid_cat.recorder import _replace_with_retry
+
+    src = tmp_path / "a.tmp"
+    src.write_bytes(b"x")
+    dst = tmp_path / "dstdir"  # non-empty dir -> replace raises OSError every time
+    dst.mkdir()
+    (dst / "keep").write_bytes(b"")
+    assert _replace_with_retry(src, dst, attempts=2, delay=0) is False
+    assert not src.exists()  # temp cleaned up after giving up
