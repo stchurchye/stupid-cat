@@ -270,7 +270,9 @@ class Database:
             clauses.append("ended_at IS NOT NULL")
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT * FROM visits {where} ORDER BY started_at DESC"
+        # Order by the parsed instant (offset-aware) so a LIMIT slice returns the
+        # truly most-recent rows even when stored timestamps mix UTC offsets.
+        sql = f"SELECT * FROM visits {where} ORDER BY datetime(started_at) DESC"
         if limit is not None and limit >= 0:
             sql += " LIMIT ?"
             params.append(limit)

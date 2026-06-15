@@ -117,6 +117,20 @@ def test_list_visits_time_filter_is_offset_aware(tmp_path: Path) -> None:
     db.close()
 
 
+def test_list_visits_ordered_by_instant_not_string(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    # A is the NEWER instant (02:00 UTC) but sorts EARLIER lexicographically than
+    # B's raw string (09:00+08 == 01:00 UTC, the older instant).
+    a = db.create_visit(cat_id="unknown", started_at="2026-06-15T02:00:00+00:00")
+    db.end_visit(a, cat_id="unknown", ended_at="2026-06-15T02:05:00+00:00", duration_sec=300, confidence=0.0)
+    b = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(b, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00", duration_sec=300, confidence=0.0)
+    newest = db.list_visits(only_ended=True, limit=1)
+    assert [r["id"] for r in newest] == [a]  # most-recent instant, not lexicographic
+    db.close()
+
+
 def test_max_cats_persisted_and_multi_cat_flag(tmp_path: Path) -> None:
     db = Database(tmp_path / "t.db")
     db.init_schema()
