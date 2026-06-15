@@ -140,15 +140,41 @@ function renderCatTable(rows, totalVisits) {
   }
 }
 
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+  return res.json();
+}
+
+function renderStatsError(message) {
+  const tbody = document.querySelector("#cat-stats tbody");
+  tbody.innerHTML = "";
+  const tr = document.createElement("tr");
+  const td = el("td");
+  td.colSpan = 6;
+  td.className = "empty-state";
+  td.innerHTML = `<p>加载失败</p><small>${message || "请检查服务是否在运行"}</small>`;
+  const btn = el("button", "重试");
+  btn.className = "text-link";
+  btn.style.marginTop = "6px";
+  btn.addEventListener("click", () => loadStats(currentDays));
+  td.appendChild(document.createElement("br"));
+  td.appendChild(btn);
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+
 async function loadStats(days) {
   currentDays = days;
   const qs = days > 0 ? `?days=${days}` : "?days=0";
-  const [statsRes, catsRes] = await Promise.all([
-    fetch(`/api/v1/stats${qs}`),
-    fetch("/api/v1/cats"),
-  ]);
-  const stats = await statsRes.json();
-  const cats = await catsRes.json();
+  let stats;
+  let cats;
+  try {
+    [stats, cats] = await Promise.all([getJSON(`/api/v1/stats${qs}`), getJSON("/api/v1/cats")]);
+  } catch (err) {
+    renderStatsError(err.message);
+    return;
+  }
   renderSummary(stats);
   renderDayChart(stats.by_day);
   renderCatTable(mergeCatRows(stats, cats), stats.total_visits);
