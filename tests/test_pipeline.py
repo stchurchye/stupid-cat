@@ -714,3 +714,29 @@ def test_retention_free_space_rotation_deletes_oldest(fast_pipeline: Pipeline, m
     fast_pipeline._retention_pass()
     assert not files["c.mp4"].exists()  # oldest removed
     assert files["a.mp4"].exists() and files["b.mp4"].exists()
+
+
+def test_mqtt_visit_ended_published(fast_pipeline: Pipeline) -> None:
+    from stupid_cat.config import MqttConfig
+    from stupid_cat.mqtt import MqttPublisher
+
+    class _Fake:
+        def __init__(self) -> None:
+            self.msgs = []
+
+        def publish(self, topic, payload) -> None:
+            self.msgs.append((topic, payload))
+
+    fake = _Fake()
+    fast_pipeline.mqtt = MqttPublisher(
+        MqttConfig(enabled=True, topic_prefix="stupid-cat/visit"), client=fake
+    )
+    t = 0.0
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    fast_pipeline.detector.in_roi = False
+    for _ in range(20):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    assert any(topic.endswith("/visit_ended") for topic, _ in fake.msgs)

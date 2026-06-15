@@ -73,6 +73,8 @@ recorder:
   retention_days: 0                  # 自动删除超过该天数的录像(0=永久保留);与 min_free_mb 一起防止占满盘
 
 mqtt:
+  # 启用需 pip install paho-mqtt。发布主题:<prefix>/visit_ended、<prefix>/alert/low_disk、
+  # <prefix>/alert/frame_errors。可接 Home Assistant 做掉线/满盘/如厕通知。
   enabled: false
   broker_host: "192.168.1.1"
   broker_port: 1883
