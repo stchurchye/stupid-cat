@@ -49,6 +49,10 @@ class CatDetector:
         self.cfg = cfg
         self._model = None
         self._tracker = ConfirmTracker(cfg.yolo_confirm_frames)
+        # FP16 only on CUDA — half precision is unsupported/slow on CPU.
+        self._use_half = bool(getattr(cfg, "fp16", False)) and str(cfg.device).startswith(
+            "cuda"
+        )
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -66,6 +70,7 @@ class CatDetector:
             imgsz=self.cfg.imgsz,
             conf=self.cfg.yolo_conf,
             device=self.cfg.device,
+            half=self._use_half,
             verbose=False,
         )
         boxes: list[BBox] = []

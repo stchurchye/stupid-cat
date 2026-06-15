@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 FUSION_MODES = frozenset({"weighted_median", "weighted_mean", "best_frame"})
+
+# Conservative reference-image quality gate (spec §6.6): reject crops that are
+# too small or essentially blank (a flat patch with no texture) so they don't
+# poison a cat's centroid. The gate keys on dynamic range, NOT absolute
+# brightness, so a genuinely dark IR crop of a black cat (low mean but real
+# texture) still passes — only uniform all-black / all-white patches are dropped.
+_REF_MIN_SIDE = 16
+# p99-p1 pixel spread; below this the crop is effectively flat. Uses percentiles
+# (not raw max-min) so a single hot/dead sensor pixel can't make a blank patch
+# look textured, and a modest threshold so genuinely low-contrast dark IR crops
+# of a black cat still pass.
+_REF_MIN_RANGE = 6
 
 
 @dataclass
@@ -57,6 +72,22 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a_n, b_n))
 
 
+def _weighted_median_1d(values: np.ndarray, weights: np.ndarray) -> float:
+    """Exact weighted median: smallest value whose cumulative weight reaches half.
+
+    Uses true weights (no integer replication), so fractional per-camera weights
+    such as 0.5 / 1.5 actually influence the result instead of all rounding to 1.
+    """
+    order = np.argsort(values, kind="stable")
+    v = values[order]
+    w = weights[order]
+    cutoff = 0.5 * float(w.sum())
+    cum = np.cumsum(w)
+    idx = int(np.searchsorted(cum, cutoff, side="left"))
+    idx = min(idx, len(v) - 1)
+    return float(v[idx])
+
+
 def fuse_embeddings(
     embeddings: list[np.ndarray],
     weights: list[float],
@@ -90,13 +121,14 @@ def fuse_embeddings(
         return l2_normalize(merged)
 
     if mode == "weighted_median":
-        merged = np.zeros(dim, dtype=np.float32)
-        for dim_idx in range(dim):
-            samples: list[float] = []
-            for emb, weight in zip(embs, weights):
-                reps = max(1, int(round(weight)))
-                samples.extend([float(emb[dim_idx])] * reps)
-            merged[dim_idx] = float(np.median(samples))
+        stack = np.stack(embs)  # (N, dim)
+        w = np.asarray(weights, dtype=np.float64)
+        if not np.isfinite(w).all() or w.sum() <= 0:
+            w = np.ones(len(embs), dtype=np.float64)
+        merged = np.array(
+            [_weighted_median_1d(stack[:, d], w) for d in range(dim)],
+            dtype=np.float32,
+        )
         return l2_normalize(merged)
 
     assert mode == "best_frame"
@@ -151,13 +183,34 @@ def load_centroid(path: Path | str) -> np.ndarray | None:
     return l2_normalize(np.load(path, allow_pickle=False))
 
 
+def ref_quality_ok(frame: np.ndarray) -> bool:
+    """True if a reference crop is large enough and has real texture.
+
+    Uses the p99-p1 percentile spread (not raw max-min, which a single hot/dead
+    pixel could inflate) rather than absolute brightness, so a dark IR crop of a
+    black cat is kept while a flat all-black/all-white patch is rejected.
+    """
+    if frame.ndim < 2:
+        return False
+    h, w = frame.shape[:2]
+    if min(h, w) < _REF_MIN_SIDE:
+        return False
+    lo, hi = np.percentile(frame, (1, 99))
+    return float(hi) - float(lo) >= _REF_MIN_RANGE
+
+
 def build_centroid_from_refs(
     embedder: Embedder,
     refs_dir: Path,
     preprocess_cfg: object,
     min_refs: int,
 ) -> np.ndarray | None:
-    """Mean L2-normalized embedding over ref images (spec §6.6)."""
+    """Mean L2-normalized embedding over ref images (spec §6.6).
+
+    Low-quality crops (too small or essentially blank) are skipped so they do not
+    contaminate the centroid; if fewer than ``min_refs`` usable crops remain, no
+    centroid is written.
+    """
     import cv2
 
     from stupid_cat.preprocess import preprocess_frame
@@ -169,13 +222,21 @@ def build_centroid_from_refs(
         return None
 
     vectors: list[np.ndarray] = []
+    skipped = 0
     for path in paths:
         frame = cv2.imread(str(path))
         if frame is None:
+            skipped += 1
+            continue
+        if not ref_quality_ok(frame):
+            logger.warning("skipping low-quality reference image %s", path)
+            skipped += 1
             continue
         frame = preprocess_frame(frame, preprocess_cfg)
         vectors.append(embedder.embed(frame))
 
+    if skipped:
+        logger.info("%s: used %d refs, skipped %d", refs_dir, len(vectors), skipped)
     if len(vectors) < min_refs:
         return None
 
@@ -201,10 +262,18 @@ def load_all_centroids(cats_dir: Path | str) -> dict[str, np.ndarray]:
 class Embedder:
     """Lazy-loaded EfficientNet-B0 feature extractor."""
 
-    def __init__(self, device: str = "cpu", backbone: str = "efficientnet_b0") -> None:
+    def __init__(
+        self,
+        device: str = "cpu",
+        backbone: str = "efficientnet_b0",
+        *,
+        fp16: bool = False,
+    ) -> None:
         if backbone != "efficientnet_b0":
             raise ValueError(f"unsupported backbone: {backbone}")
         self.device = device
+        # FP16 only on CUDA — half precision on CPU/MPS is unsupported or slower.
+        self._use_half = bool(fp16) and str(device).startswith("cuda")
         self._model = None
         self._transform = None
         self._lock = threading.Lock()
@@ -220,24 +289,32 @@ class Embedder:
         model.classifier = torch.nn.Identity()
         model.eval()
         model.to(self.device)
+        if self._use_half:
+            model.half()
         self._model = model
         self._transform = weights.transforms()
 
     def embed(self, crop_bgr: np.ndarray) -> np.ndarray:
+        import cv2
         import torch
-        from PIL import Image
 
         if crop_bgr.ndim != 3 or crop_bgr.shape[2] != 3:
             raise ValueError("crop_bgr must be HxWx3 BGR")
         if crop_bgr.shape[0] < 2 or crop_bgr.shape[1] < 2:
             raise ValueError("crop is too small to embed")
 
+        # cv2 conversion yields a contiguous RGB array (no negative-stride view
+        # that PIL/torch would silently copy or reject).
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
         with self._lock:
             self._ensure_loaded()
             assert self._transform is not None
-            rgb = crop_bgr[:, :, ::-1]
-            tensor = self._transform(Image.fromarray(rgb)).unsqueeze(0).to(self.device)
+            tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+            tensor = self._transform(tensor).unsqueeze(0).to(self.device)
+            if self._use_half:
+                tensor = tensor.half()
             with torch.no_grad():
                 features = self._model(tensor)
-            vec = features.squeeze(0).cpu().numpy()
+            vec = features.squeeze(0).float().cpu().numpy()
             return l2_normalize(vec)

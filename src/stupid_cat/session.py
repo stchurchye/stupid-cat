@@ -52,6 +52,10 @@ class VisitSessionFSM:
             self.state = "idle"
             self.enter_accumulator = 0.0
             self.cooldown_until = None
+            # Drop stale per-camera qualification from before the visit, else a
+            # camera that went silent while last seen as "qualified" keeps
+            # `any_qualified` True and accumulates a phantom entry.
+            self._last_frame_qualified = dict.fromkeys(self.camera_ids, False)
 
         self._last_frame_qualified[camera_id] = qualified
         if qualified:
@@ -72,6 +76,20 @@ class VisitSessionFSM:
 
         if self.enter_accumulator >= self.enter_overlap_sec:
             self._start_visit(timestamp)
+
+    def on_tick(self, timestamp: float) -> None:
+        """Wall-clock watchdog: end an active visit even when no frames arrive.
+
+        Without this, a total camera outage during a visit leaves the FSM stuck
+        in ``active`` forever, since exit is only evaluated on frame arrival.
+        Only advances time forward and never refreshes per-camera qualification.
+        """
+        if self.state != "active":
+            return
+        if self._last_ts is not None and timestamp <= self._last_ts:
+            return
+        self._last_ts = timestamp
+        self._maybe_end_visit(timestamp)
 
     def pause(self, timestamp: float) -> None:
         if self.state == "active":
@@ -104,22 +122,23 @@ class VisitSessionFSM:
         duration = max(0.0, timestamp - self.started_at)
         discard = duration < self.min_visit_sec
 
-        if self.on_visit_end:
-            self.on_visit_end(
-                self.visit_id,
-                self.started_at,
-                timestamp,
-                duration,
-                discard,
-            )
-
-        self.visit_id = None
-        self.started_at = None
-
-        if enter_cooldown:
-            self.state = "cooldown"
-            self.cooldown_until = timestamp + self.cooldown_sec
-        else:
-            self.state = "idle"
-
-        self.enter_accumulator = 0.0
+        # Always transition state even if the callback raises, or the FSM would
+        # wedge in "active" forever and never detect another visit.
+        try:
+            if self.on_visit_end:
+                self.on_visit_end(
+                    self.visit_id,
+                    self.started_at,
+                    timestamp,
+                    duration,
+                    discard,
+                )
+        finally:
+            self.visit_id = None
+            self.started_at = None
+            if enter_cooldown:
+                self.state = "cooldown"
+                self.cooldown_until = timestamp + self.cooldown_sec
+            else:
+                self.state = "idle"
+            self.enter_accumulator = 0.0
