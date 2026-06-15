@@ -152,6 +152,8 @@ class Database:
         camera_ids: list[str] | None = None,
         recording_path: str | None = None,
         max_cats: int | None = None,
+        waste_type: str | None = None,
+        waste_confidence: float | None = None,
     ) -> None:
         with self._lock:
             conn = self._connection()
@@ -177,6 +179,9 @@ class Database:
                 updates["recording_path"] = recording_path
             if max_cats is not None:
                 updates["max_cats"] = max_cats
+            if waste_type is not None:
+                updates["waste_type"] = waste_type
+                updates["waste_confidence"] = waste_confidence or 0.0
 
             set_clause = ", ".join(f"{col} = ?" for col in updates)
             conn.execute(
@@ -296,6 +301,19 @@ class Database:
                 VALUES (?, ?, ?, ?)
                 """,
                 (visit_id, old_cat_id, new_cat_id, _utc_now_iso()),
+            )
+            conn.commit()
+
+    def set_waste_type(self, visit_id: str, waste_type: str) -> None:
+        """Manually override the pee/poop classification for a visit."""
+        with self._lock:
+            conn = self._connection()
+            row = conn.execute("SELECT id FROM visits WHERE id = ?", (visit_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"visit not found: {visit_id}")
+            conn.execute(
+                "UPDATE visits SET waste_type = ?, waste_confidence = 1.0 WHERE id = ?",
+                (waste_type, visit_id),
             )
             conn.commit()
 

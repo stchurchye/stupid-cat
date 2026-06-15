@@ -19,6 +19,10 @@ class CorrectVisitBody(BaseModel):
     cat_id: str
 
 
+class WasteBody(BaseModel):
+    waste_type: str
+
+
 def _visit_recordings(pipeline: Pipeline, visit: dict) -> list[dict[str, str]]:
     visit_id = visit["id"]
     primary = pipeline.cfg.recorder.primary_camera
@@ -122,6 +126,16 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "visit_id": visit_id, "cat_id": body.cat_id}
+
+    @app.post("/api/v1/visits/{visit_id}/waste")
+    def set_waste(visit_id: str, body: WasteBody) -> dict:
+        if body.waste_type not in ("pee", "poop", "unknown"):
+            raise HTTPException(status_code=400, detail="waste_type must be pee/poop/unknown")
+        try:
+            db.set_waste_type(visit_id, body.waste_type)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True, "visit_id": visit_id, "waste_type": body.waste_type}
 
     @app.post("/api/v1/cats/{cat_id}/rebuild-embedding")
     def rebuild_embedding(cat_id: str) -> dict:
