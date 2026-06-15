@@ -108,6 +108,11 @@ class SessionConfig:
     exit_no_cat_sec: float = 8.0
     cooldown_sec: float = 3.0
     min_visit_sec: float = 3.0
+    # True when the cameras share a view of the same box (default): a cat seen by
+    # both at once is ONE cat, so multi-cat is detected per-frame (>=2 boxes in one
+    # view). Set False only for DISJOINT cameras (each covers a different area),
+    # where a cat in two views simultaneously means two cats.
+    cameras_overlap: bool = True
 
 
 @dataclass
