@@ -1,9 +1,4 @@
-function el(tag, text, className) {
-  const node = document.createElement(tag);
-  if (text != null) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
+// el() and getJSON() live in util.js (loaded first).
 
 function formatTime(iso) {
   if (!iso) return "—";
@@ -27,16 +22,6 @@ function formatDuration(sec) {
   const n = Number(sec);
   if (Number.isNaN(n)) return String(sec);
   return `${n} 秒`;
-}
-
-async function getJSON(url) {
-  const res = await fetch(url);
-  if (res.status === 401) {
-    window.location.href = "/login"; // session expired / key rotated -> re-auth
-    throw new Error("unauthorized");
-  }
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
 }
 
 function showToast(message, kind = "error") {

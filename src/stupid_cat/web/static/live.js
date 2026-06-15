@@ -1,11 +1,6 @@
 const REFRESH_MS = 800;
 
-function el(tag, text, className) {
-  const node = document.createElement(tag);
-  if (text != null) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
+// el() lives in util.js (loaded first).
 
 function startPreview(cameraId, statusEl, imgEl) {
   const tick = () => {

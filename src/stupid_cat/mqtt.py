@@ -46,6 +46,9 @@ class MqttPublisher:
         self._client = client
 
     def publish(self, subtopic: str, payload: dict[str, Any]) -> None:
+        # Fire-and-forget: paho's publish() only enqueues onto the loop_start
+        # background thread, so this is non-blocking and safe to call while the
+        # pipeline holds its lock (e.g. from _on_visit_end / _disk_ok).
         if not self._enabled or self._client is None:
             return
         topic = f"{self.cfg.topic_prefix}/{subtopic}"

@@ -274,6 +274,15 @@ def test_set_waste_logs_correction_and_accuracy(tmp_path: Path) -> None:
     assert db.waste_accuracy()["total_corrections"] == 1
 
 
+def test_first_time_label_on_unknown_not_counted_as_correction(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+                 duration_sec=120, confidence=0.5)  # waste_type stays 'unknown'
+    db.set_waste_type(vid, "pee")  # first human label, heuristic never predicted
+    assert db.waste_accuracy()["total_corrections"] == 0  # unknown->pee is not a misprediction
+
+
 def test_db_backup_creates_consistent_copy(tmp_path: Path) -> None:
     db = _db(tmp_path)
     vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")

@@ -196,16 +196,6 @@ def fuse_embeddings(
     return l2_normalize(best_emb)
 
 
-def max_centroid_similarity(
-    embedding: np.ndarray,
-    centroids: dict[str, np.ndarray],
-) -> float:
-    """Highest cosine similarity to any known centroid (spec §9.3 correction frame)."""
-    if not centroids:
-        return 0.0
-    return max(cosine_similarity(embedding, c) for c in centroids.values())
-
-
 def match_cat(
     visit_vector: np.ndarray,
     centroids: dict[str, np.ndarray],

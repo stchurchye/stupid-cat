@@ -1,11 +1,6 @@
 let currentDays = 7;
 
-function el(tag, text, className) {
-  const node = document.createElement(tag);
-  if (text != null) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
+// el() and getJSON() live in util.js (loaded first).
 
 function formatDuration(sec) {
   if (!sec) return "0 秒";
@@ -138,16 +133,6 @@ function renderCatTable(rows, totalVisits) {
     tr.appendChild(shareTd);
     tbody.appendChild(tr);
   }
-}
-
-async function getJSON(url) {
-  const res = await fetch(url);
-  if (res.status === 401) {
-    window.location.href = "/login";
-    throw new Error("unauthorized");
-  }
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
 }
 
 function renderStatsError(message) {
