@@ -9,6 +9,10 @@ New-Item -ItemType Directory -Force -Path $tmp, $cache, (Join-Path $Root "models
 $env:TMP = $tmp
 $env:TEMP = $tmp
 $env:PIP_CACHE_DIR = $cache
+$env:HTTP_PROXY = ''
+$env:HTTPS_PROXY = ''
+$env:http_proxy = ''
+$env:https_proxy = ''
 
 $py = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) {
