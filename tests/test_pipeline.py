@@ -320,6 +320,18 @@ def test_multi_cat_debounced_against_single_frame_split(fast_pipeline: Pipeline)
     assert visit["multi_cat"] is False
 
 
+def test_recover_sweeps_browser_temp(fast_pipeline: Pipeline) -> None:
+    rec = fast_pipeline.recordings_dir
+    rec.mkdir(parents=True, exist_ok=True)
+    temp = rec / "abc.browser.mp4"
+    temp.write_bytes(b"x")
+    keep = rec / "abc.mp4"
+    keep.write_bytes(b"x")
+    fast_pipeline._recover_orphan_visits()
+    assert not temp.exists()  # interrupted re-encode temp swept
+    assert keep.exists()  # real clip untouched
+
+
 def test_multi_cat_intermittent_splits_not_flagged(fast_pipeline: Pipeline) -> None:
     # Two boxes appear only on alternating frames (never _MULTI_CAT_MIN_FRAMES in a
     # row), so the streak never confirms and it stays single-cat. The old frame-tally

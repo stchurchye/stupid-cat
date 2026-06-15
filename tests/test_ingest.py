@@ -28,3 +28,13 @@ def test_rate_limited_respects_fps(tmp_path, monkeypatch) -> None:
     )
     assert len(events) >= 3
     assert all(e.camera_id == "cam1" for e in events)
+
+
+def test_rtsp_backoff_grows_and_caps() -> None:
+    from stupid_cat.ingest import RtspSource
+
+    s = RtspSource("cam1", "rtsp://x", reconnect_delay_sec=5.0, max_reconnect_delay_sec=60.0)
+    assert s._backoff_delay(0) == 5.0
+    assert s._backoff_delay(1) == 10.0
+    assert s._backoff_delay(2) == 20.0
+    assert s._backoff_delay(10) == 60.0  # capped at max
