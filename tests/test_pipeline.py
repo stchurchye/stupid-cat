@@ -192,7 +192,7 @@ def test_set_centroid_is_copy_on_write(fast_pipeline: Pipeline) -> None:
 def test_correct_visit_appends_ref(fast_pipeline: Pipeline, tmp_path: Path) -> None:
     visit_id = "visit-test-1"
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    fast_pipeline._save_correction_crop(visit_id, crop)
+    fast_pipeline._save_correction_crops(visit_id, {"cam1": crop})
     fast_pipeline.db.create_visit(
         visit_id=visit_id,
         cat_id="unknown",
@@ -206,11 +206,101 @@ def test_correct_visit_appends_ref(fast_pipeline: Pipeline, tmp_path: Path) -> N
         confidence=0.0,
     )
 
-    assert fast_pipeline._load_correction_crop(visit_id) is not None
+    assert fast_pipeline._load_correction_crops(visit_id)
     fast_pipeline.correct_visit(visit_id, "mimi")
-    ref_path = tmp_path / "data" / "cats" / "mimi" / "refs" / f"{visit_id}.jpg"
+    ref_path = tmp_path / "data" / "cats" / "mimi" / "refs" / f"{visit_id}_cam1.jpg"
     assert ref_path.exists()
-    assert fast_pipeline._load_correction_crop(visit_id) is None
+    assert fast_pipeline._load_correction_crops(visit_id) == {}
     row = fast_pipeline.db.get_visit(visit_id)
     assert row is not None
     assert row["cat_id"] == "mimi"
+
+
+def test_correct_visit_appends_dual_camera_refs(fast_pipeline: Pipeline, tmp_path: Path) -> None:
+    visit_id = "visit-dual-1"
+    crop = np.zeros((100, 100, 3), dtype=np.uint8)
+    fast_pipeline._save_correction_crops(
+        visit_id,
+        {"cam1": crop, "cam2": crop + 1},
+    )
+    fast_pipeline.db.create_visit(
+        visit_id=visit_id,
+        cat_id="unknown",
+        started_at="2026-06-02T10:00:00+08:00",
+    )
+    fast_pipeline.db.end_visit(
+        visit_id,
+        cat_id="unknown",
+        ended_at="2026-06-02T10:01:00+08:00",
+        duration_sec=60,
+        confidence=0.0,
+    )
+
+    fast_pipeline.correct_visit(visit_id, "mimi")
+    refs_dir = tmp_path / "data" / "cats" / "mimi" / "refs"
+    assert (refs_dir / f"{visit_id}_cam1.jpg").exists()
+    assert (refs_dir / f"{visit_id}_cam2.jpg").exists()
+
+
+def test_dual_camera_recording_writes_both_clips(tmp_path: Path) -> None:
+    repo_cfg = Path(__file__).resolve().parents[1] / "config.yaml"
+    data = yaml.safe_load(repo_cfg.read_text(encoding="utf-8"))
+    data["session"]["enter_overlap_sec"] = 0.05
+    data["session"]["exit_no_cat_sec"] = 0.1
+    data["session"]["cooldown_sec"] = 0.05
+    data["session"]["min_visit_sec"] = 0.01
+    data["recorder"]["record_cameras"] = ["cam1", "cam2"]
+    data["recorder"]["min_free_mb"] = 0
+    for cam in data["cameras"]:
+        cam["stream_width"] = 640
+        cam["stream_height"] = 480
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.dump(data), encoding="utf-8")
+    cfg = load_config(cfg_path)
+    db = Database(tmp_path / "test.db")
+    pipeline = Pipeline(
+        cfg,
+        db=db,
+        data_dir=tmp_path / "data",
+        detector=FakeDetector(),
+        embedder=FakeEmbedder(),
+    )
+    pipeline.cfg.recorder.enabled = True
+
+    t = 0.0
+    for _ in range(10):
+        pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        pipeline._process_frame(FrameEvent("cam2", _frame(), t))
+        t += 0.05
+    pipeline.detector.in_roi = False
+    for _ in range(20):
+        pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        pipeline._process_frame(FrameEvent("cam2", _frame(), t))
+        t += 0.05
+
+    visit = pipeline.db.list_visits(only_ended=True)[0]
+    rec_dir = pipeline.recordings_dir
+    assert (rec_dir / f"{visit['id']}.mp4").exists()
+    assert (rec_dir / f"{visit['id']}_cam2.mp4").exists()
+
+
+def test_recording_continues_without_detection(fast_pipeline: Pipeline) -> None:
+    """Clips should keep writing while the visit is active even if YOLO misses the cat."""
+    fast_pipeline.cfg.recorder.enabled = True
+    fast_pipeline.cfg.recorder.min_free_mb = 0
+    fast_pipeline.fsm.exit_no_cat_sec = 999.0
+
+    t = 0.0
+    for _ in range(6):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    assert fast_pipeline.fsm.state == "active"
+
+    fast_pipeline.detector.in_roi = False
+    for _ in range(20):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+
+    rec = fast_pipeline._visit_recorders.get("cam1")
+    assert rec is not None
+    assert rec.frames_written >= 21

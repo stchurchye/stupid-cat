@@ -11,11 +11,41 @@ from pydantic import BaseModel
 
 from stupid_cat.db import Database
 from stupid_cat.pipeline import Pipeline
+from stupid_cat.recorder import visit_recording_filename
 from stupid_cat.timeutil import local_iso_cutoff
 
 
 class CorrectVisitBody(BaseModel):
     cat_id: str
+
+
+def _visit_recordings(pipeline: Pipeline, visit: dict) -> list[dict[str, str]]:
+    visit_id = visit["id"]
+    primary = pipeline.cfg.recorder.primary_camera
+    name_by_id = {c.id: c.name or c.id for c in pipeline.cfg.cameras}
+    out: list[dict[str, str]] = []
+    for cam_id in pipeline.record_camera_ids():
+        filename = visit_recording_filename(visit_id, cam_id, primary_camera=primary)
+        if (pipeline.recordings_dir / filename).exists():
+            out.append(
+                {
+                    "camera_id": cam_id,
+                    "name": name_by_id.get(cam_id, cam_id),
+                    "url": f"/recordings/{filename}",
+                }
+            )
+    return out
+
+
+def _enrich_visit(pipeline: Pipeline, visit: dict) -> dict:
+    recordings = _visit_recordings(pipeline, visit)
+    visit = dict(visit)
+    visit["recordings"] = recordings
+    if recordings:
+        visit["recording_url"] = recordings[0]["url"]
+    elif visit.get("recording_path"):
+        visit["recording_url"] = f"/recordings/{visit['id']}.mp4"
+    return visit
 
 
 def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
@@ -51,7 +81,8 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
 
     @app.get("/api/v1/visits")
     def list_visits(from_ts: str | None = None, to_ts: str | None = None, cat_id: str | None = None) -> list:
-        return db.list_visits(from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True)
+        visits = db.list_visits(from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True)
+        return [_enrich_visit(pipeline, v) for v in visits]
 
     @app.get("/api/v1/stats")
     def visit_stats(
@@ -70,9 +101,7 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         row = db.get_visit(visit_id)
         if row is None:
             raise HTTPException(status_code=404, detail="visit not found")
-        if row.get("recording_path"):
-            row["recording_url"] = f"/recordings/{visit_id}.mp4"
-        return row
+        return _enrich_visit(pipeline, row)
 
     @app.post("/api/v1/visits/{visit_id}/correct")
     def correct_visit(visit_id: str, body: CorrectVisitBody) -> dict:

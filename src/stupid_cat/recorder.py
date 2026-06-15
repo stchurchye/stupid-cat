@@ -14,11 +14,17 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def visit_recording_filename(visit_id: str, camera_id: str, *, primary_camera: str) -> str:
+    if camera_id == primary_camera:
+        return f"{visit_id}.mp4"
+    return f"{visit_id}_{camera_id}.mp4"
+
 _BROWSER_CODECS = ("avc1", "H264", "mp4v")
 
 
 class VisitRecorder:
-    """Write primary-camera frames to data/recordings/{visit_id}.mp4 (capped at max_seconds)."""
+    """Write visit clips to data/recordings/ (capped at max_seconds per camera)."""
 
     def __init__(
         self,
@@ -41,10 +47,10 @@ class VisitRecorder:
     def frames_written(self) -> int:
         return self._frames_written
 
-    def start(self, visit_id: str, frame_bgr: np.ndarray) -> Path:
+    def start(self, visit_id: str, frame_bgr: np.ndarray, *, filename: str | None = None) -> Path:
         self.stop()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._path = self.output_dir / f"{visit_id}.mp4"
+        self._path = self.output_dir / (filename or f"{visit_id}.mp4")
         h, w = frame_bgr.shape[:2]
         self._writer, self._fourcc = _open_video_writer(self._path, self.fps, (w, h))
         self._frames_written = 0

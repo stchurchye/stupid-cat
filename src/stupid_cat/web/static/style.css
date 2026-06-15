@@ -312,6 +312,19 @@ td.recording video {
   background: #111;
 }
 
+.recording-block + .recording-block {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--outline-variant);
+}
+
+.recording-label {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--on-surface-variant);
+  margin-bottom: 0.35rem;
+}
+
 .text-link {
   display: inline-block;
   margin-top: 0.5rem;

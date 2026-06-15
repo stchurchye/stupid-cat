@@ -18,7 +18,7 @@ from stupid_cat.detector import CatDetector, select_primary_bbox
 from stupid_cat.geometry import bbox_roi_overlap_ratio
 from stupid_cat.ingest import FrameEvent, FrameSource, MultiCameraIngest, VideoFileSource
 from stupid_cat.preprocess import preprocess_frame
-from stupid_cat.recorder import VisitRecorder, reencode_for_browser
+from stupid_cat.recorder import VisitRecorder, reencode_for_browser, visit_recording_filename
 from stupid_cat.reid import (
     EmbeddingBuffer,
     EmbeddingRecord,
@@ -116,11 +116,12 @@ class Pipeline:
         )
 
         self._embedding_buffer: EmbeddingBuffer | None = None
+        self._visit_recorders: dict[str, VisitRecorder] = {}
         self._recording_path: Path | None = None
         self._camera_ids_seen: set[str] = set()
         self._visit_started_at: str | None = None
-        self._best_correction_crop: np.ndarray | None = None
-        self._best_correction_area: float = -1.0
+        self._best_correction_crops: dict[str, np.ndarray] = {}
+        self._best_correction_areas: dict[str, float] = {}
         self._last_frame_at: dict[str, str] = {}
         self._preview_lock = threading.Lock()
         self._preview_frames: dict[str, np.ndarray] = {}
@@ -188,6 +189,41 @@ class Pipeline:
     @property
     def recordings_dir(self) -> Path:
         return self._data_dir / "recordings"
+
+    def record_camera_ids(self) -> list[str]:
+        configured = self.cfg.recorder.record_cameras
+        if configured is not None:
+            return [c for c in configured if c in self.camera_weights]
+        return [self.cfg.recorder.primary_camera]
+
+    def _stop_visit_recorders(self, *, reencode: bool = True) -> dict[str, Path]:
+        paths: dict[str, Path] = {}
+        for camera_id, rec in list(self._visit_recorders.items()):
+            path = rec.stop(reencode=reencode)
+            if path is not None:
+                paths[camera_id] = path
+        self._visit_recorders.clear()
+        return paths
+
+    def _write_visit_recording(self, camera_id: str, visit_id: str, frame: np.ndarray) -> None:
+        rec = self._visit_recorders.get(camera_id)
+        if rec is None:
+            rec = VisitRecorder(
+                self.recordings_dir,
+                max_seconds=self.cfg.recorder.max_seconds,
+                fps=float(self.cfg.inference.active_fps),
+            )
+            filename = visit_recording_filename(
+                visit_id,
+                camera_id,
+                primary_camera=self.cfg.recorder.primary_camera,
+            )
+            rec.start(visit_id, frame, filename=filename)
+            self._visit_recorders[camera_id] = rec
+            if camera_id == self.cfg.recorder.primary_camera:
+                self._recording_path = self.recordings_dir / filename
+        else:
+            rec.write_frame(frame)
 
     @property
     def paused(self) -> bool:
@@ -349,24 +385,50 @@ class Pipeline:
             )
         return False
 
-    def _correction_crop_path(self, visit_id: str) -> Path:
+    def _correction_crop_path(self, visit_id: str, camera_id: str) -> Path:
+        return self._data_dir / "correction_crops" / f"{visit_id}_{camera_id}.jpg"
+
+    def _legacy_correction_crop_path(self, visit_id: str) -> Path:
         return self._data_dir / "correction_crops" / f"{visit_id}.jpg"
 
-    def _save_correction_crop(self, visit_id: str, crop: np.ndarray) -> None:
-        path = self._correction_crop_path(visit_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(path), crop):
-            logger.warning("failed to write correction crop %s", path)
+    def _save_correction_crops(self, visit_id: str, crops: dict[str, np.ndarray]) -> None:
+        if not crops:
+            return
+        out_dir = self._data_dir / "correction_crops"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for camera_id, crop in crops.items():
+            path = self._correction_crop_path(visit_id, camera_id)
+            if not cv2.imwrite(str(path), crop):
+                logger.warning("failed to write correction crop %s", path)
 
-    def _load_correction_crop(self, visit_id: str) -> np.ndarray | None:
-        path = self._correction_crop_path(visit_id)
-        if not path.exists():
-            return None
-        crop = cv2.imread(str(path))
-        return crop
+    def _load_correction_crops(self, visit_id: str) -> dict[str, np.ndarray]:
+        crops: dict[str, np.ndarray] = {}
+        prefix = f"{visit_id}_"
+        crop_dir = self._data_dir / "correction_crops"
+        if crop_dir.is_dir():
+            for path in sorted(crop_dir.glob(f"{visit_id}_*.jpg")):
+                if not path.name.startswith(prefix):
+                    continue
+                camera_id = path.name[len(prefix) :].removesuffix(".jpg")
+                if not camera_id:
+                    continue
+                crop = cv2.imread(str(path))
+                if crop is not None:
+                    crops[camera_id] = crop
+        if not crops:
+            legacy = self._legacy_correction_crop_path(visit_id)
+            if legacy.exists():
+                crop = cv2.imread(str(legacy))
+                if crop is not None:
+                    crops[self.cfg.recorder.primary_camera] = crop
+        return crops
 
-    def _delete_correction_crop(self, visit_id: str) -> None:
-        self._correction_crop_path(visit_id).unlink(missing_ok=True)
+    def _delete_correction_crops(self, visit_id: str) -> None:
+        crop_dir = self._data_dir / "correction_crops"
+        if not crop_dir.is_dir():
+            return
+        for path in crop_dir.glob(f"{visit_id}*.jpg"):
+            path.unlink(missing_ok=True)
 
     def _roi_for_frame(self, camera_id: str, frame_w: int, frame_h: int) -> list:
         """ROI polygon scaled from its calibration resolution to the actual frame.
@@ -409,32 +471,29 @@ class Pipeline:
         with self._lock:
             self._last_frame_at[camera_id] = _iso_now()
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
-
-            if self.fsm.state != "active" or primary is None:
-                active = False
-            else:
-                active = True
+            visit_active = self.fsm.state == "active"
+            visit_id = self.fsm.visit_id
+            embed_work = visit_active and primary is not None
 
         with self._preview_lock:
             self._preview_frames[camera_id] = frame.copy()
             self._preview_boxes[camera_id] = boxes
             self._preview_qualified[camera_id] = qualified
 
-        if not active:
+        if visit_active:
+            with self._lock:
+                self._camera_ids_seen.add(camera_id)
+                if (
+                    self._record_this_visit
+                    and camera_id in self.record_camera_ids()
+                    and visit_id
+                ):
+                    self._write_visit_recording(camera_id, visit_id, frame)
+
+        if not embed_work:
             return False
 
         with self._lock:
-
-            self._camera_ids_seen.add(camera_id)
-            if (
-                self._record_this_visit
-                and camera_id == self.cfg.recorder.primary_camera
-                and self.fsm.visit_id
-            ):
-                if self._recording_path is None:
-                    self._recording_path = self.recorder.start(self.fsm.visit_id, frame)
-                else:
-                    self.recorder.write_frame(frame)
 
             crop = _crop_bgr(frame, primary)
             short_side = min(crop.shape[0], crop.shape[1])
@@ -445,7 +504,7 @@ class Pipeline:
             bbox_area = max(0.0, primary[2] - primary[0]) * max(0.0, primary[3] - primary[1])
             weight = self.camera_weights.get(camera_id, 0.5)
             visit_id = self.fsm.visit_id
-            best_area = self._best_correction_area
+            best_area = self._best_correction_areas.get(camera_id, -1.0)
 
         # Re-ID forward pass is the slow part — run it WITHOUT the lock so the API
         # (/health) and the FSM watchdog aren't blocked for the inference time.
@@ -460,14 +519,10 @@ class Pipeline:
             # attach to the still-current visit's buffer.
             if self._embedding_buffer is None or self.fsm.visit_id != visit_id:
                 return False
-            # Keep the largest, clearest crop as the visit's representative for the
-            # correction gallery — chosen by crop size, NOT by similarity to an
-            # existing centroid (which would bias corrections toward whatever the
-            # model already guessed). Must also pass the ref-quality gate, else the
-            # saved ref would be dropped at centroid-build time (correction no-op).
-            if bbox_area > self._best_correction_area and crop_ok:
-                self._best_correction_area = bbox_area
-                self._best_correction_crop = crop
+            # Per camera: keep the largest, clearest crop for correction refs.
+            if bbox_area > self._best_correction_areas.get(camera_id, -1.0) and crop_ok:
+                self._best_correction_areas[camera_id] = bbox_area
+                self._best_correction_crops[camera_id] = crop
             self._embedding_buffer.add(
                 EmbeddingRecord(
                     embedding=embedding,
@@ -481,13 +536,14 @@ class Pipeline:
     def _on_visit_start(self, visit_id: str) -> None:
         # Defensively close any writer left open by an abnormally-ended visit so
         # we never leak a handle or keep writing into the wrong file.
-        self.recorder.stop()
+        self._stop_visit_recorders(reencode=False)
+        self.recorder.stop(reencode=False)
         self._embedding_buffer = EmbeddingBuffer(self.cfg.inference.fusion_max_frames)
         self._camera_ids_seen = set()
         self._recording_path = None
         self._visit_started_at = _iso_now()
-        self._best_correction_crop = None
-        self._best_correction_area = -1.0
+        self._best_correction_crops = {}
+        self._best_correction_areas = {}
         # Decide once per visit whether to record (config + disk space).
         self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
         # Persist the visit at START so a crash mid-visit leaves a recoverable
@@ -513,16 +569,19 @@ class Pipeline:
     ) -> None:
         # Skip the (background) browser re-encode when we're about to discard the
         # clip, so it can't race the unlink below.
-        recording_path = self.recorder.stop(reencode=not discard)
+        recording_paths = self._stop_visit_recorders(reencode=not discard)
+        self.recorder.stop(reencode=not discard)
+        recording_path = recording_paths.get(self.cfg.recorder.primary_camera)
         self._recording_path = None
 
         if discard:
-            if recording_path and recording_path.exists():
-                recording_path.unlink(missing_ok=True)
+            for path in recording_paths.values():
+                if path.exists():
+                    path.unlink(missing_ok=True)
             self._embedding_buffer = None
-            self._best_correction_crop = None
-            self._best_correction_area = -1.0
-            self._delete_correction_crop(visit_id)
+            self._best_correction_crops = {}
+            self._best_correction_areas = {}
+            self._delete_correction_crops(visit_id)
             # Row was created at visit start; drop it since the visit is discarded.
             try:
                 self.db.delete_visit(visit_id)
@@ -531,10 +590,10 @@ class Pipeline:
             logger.info("visit %s discarded (duration %.2fs)", visit_id, duration)
             return
 
-        if self._best_correction_crop is not None:
-            self._save_correction_crop(visit_id, self._best_correction_crop)
-        self._best_correction_crop = None
-        self._best_correction_area = -1.0
+        if self._best_correction_crops:
+            self._save_correction_crops(visit_id, self._best_correction_crops)
+        self._best_correction_crops = {}
+        self._best_correction_areas = {}
 
         embs, weights = [], []
         if self._embedding_buffer and len(self._embedding_buffer) > 0:
@@ -603,6 +662,9 @@ class Pipeline:
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
         """DB correction plus optional ref append and centroid rebuild (spec §9.3).
 
+        One correction applies to the whole visit: every per-camera crop saved at
+        visit end is appended to refs/ and the cat centroid is rebuilt once.
+
         The expensive centroid rebuild (a Re-ID forward pass per ref image) runs
         WITHOUT the pipeline lock so an admin correction can't freeze frame
         ingest / the FSM watchdog; only the cheap copy-on-write swap is locked.
@@ -614,23 +676,28 @@ class Pipeline:
 
         self.db.correct_visit(visit_id, new_cat_id)
         if new_cat_id == "unknown":
-            self._delete_correction_crop(visit_id)
+            self._delete_correction_crops(visit_id)
             return
 
-        crop = self._load_correction_crop(visit_id)
-        if crop is None:
-            logger.warning("no correction crop for visit %s; DB updated only", visit_id)
+        crops = self._load_correction_crops(visit_id)
+        if not crops:
+            logger.warning("no correction crops for visit %s; DB updated only", visit_id)
             return
 
         cat_dir = self._data_dir / "cats" / new_cat_id
         refs_dir = cat_dir / "refs"
         refs_dir.mkdir(parents=True, exist_ok=True)
-        ref_path = refs_dir / f"{visit_id}.jpg"
-        if not cv2.imwrite(str(ref_path), crop):
-            logger.warning("failed to write ref %s", ref_path)
+        refs_written = 0
+        for camera_id, crop in crops.items():
+            ref_path = refs_dir / f"{visit_id}_{camera_id}.jpg"
+            if cv2.imwrite(str(ref_path), crop):
+                refs_written += 1
+            else:
+                logger.warning("failed to write ref %s", ref_path)
+        if refs_written == 0:
             return
 
-        self._delete_correction_crop(visit_id)
+        self._delete_correction_crops(visit_id)
 
         centroid = build_centroid_from_refs(
             self.embedder,
@@ -640,7 +707,8 @@ class Pipeline:
         )
         if centroid is None:
             logger.info(
-                "ref saved for %s; centroid unchanged (need %d refs)",
+                "saved %d ref(s) for %s; centroid unchanged (need %d refs)",
+                refs_written,
                 new_cat_id,
                 self.cfg.cats.min_refs,
             )

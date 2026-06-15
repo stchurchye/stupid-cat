@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stupid_cat.recorder import VisitRecorder
+from stupid_cat.recorder import VisitRecorder, visit_recording_filename
 
 
 def test_recorder_stops_writing_after_max_seconds(tmp_path: Path) -> None:
@@ -25,6 +25,19 @@ def test_recorder_stops_writing_after_max_seconds(tmp_path: Path) -> None:
 def test_recorder_stop_without_start_returns_none(tmp_path: Path) -> None:
     recorder = VisitRecorder(tmp_path, max_seconds=30)
     assert recorder.stop() is None
+
+
+def test_visit_recording_filename_primary_and_secondary() -> None:
+    assert visit_recording_filename("v1", "cam1", primary_camera="cam1") == "v1.mp4"
+    assert visit_recording_filename("v1", "cam2", primary_camera="cam1") == "v1_cam2.mp4"
+
+
+def test_recorder_custom_filename(tmp_path: Path) -> None:
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    recorder = VisitRecorder(tmp_path / "rec", max_seconds=30, fps=10)
+    path = recorder.start("visit-1", frame, filename="visit-1_cam2.mp4")
+    assert path.name == "visit-1_cam2.mp4"
+    recorder.stop(reencode=False)
 
 
 def test_recorder_wall_clock_cap_stops_writing(tmp_path: Path, monkeypatch) -> None:
