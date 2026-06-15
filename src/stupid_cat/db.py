@@ -51,6 +51,19 @@ class Database:
                 self._conn.close()
                 self._conn = None
 
+    def backup(self, dest: Path | str) -> None:
+        """Online (WAL-safe) backup of the live DB to ``dest`` via SQLite's backup
+        API — consistent even while the pipeline is writing, unlike a file copy."""
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            src = self._connection()
+            target = sqlite3.connect(dest)
+            try:
+                src.backup(target)
+            finally:
+                target.close()
+
     def init_schema(self) -> None:
         with self._lock:
             conn = self._connection()

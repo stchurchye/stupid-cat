@@ -272,3 +272,17 @@ def test_set_waste_logs_correction_and_accuracy(tmp_path: Path) -> None:
     assert acc["confusion"]["pee->poop"] == 1
     db.set_waste_type(vid, "poop")  # no change -> not logged again
     assert db.waste_accuracy()["total_corrections"] == 1
+
+
+def test_db_backup_creates_consistent_copy(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+                 duration_sec=60, confidence=0.5)
+    dest = tmp_path / "backup" / "copy.db"
+    db.backup(dest)
+    assert dest.exists()
+    restored = Database(dest)
+    restored.init_schema()
+    assert len(restored.list_visits()) == 1
+    restored.close()

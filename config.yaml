@@ -69,6 +69,8 @@ recorder:
   primary_camera: "cam1"
   record_cameras: ["cam1", "cam2"]   # 录两路视角(主+辅);只想录主摄就删掉这行
   max_seconds: 300                   # 录像片段上限(秒);时长记录不受此限,始终是完整墙钟
+  min_free_mb: 500                   # 剩余磁盘低于此:暂停录像,并按时间从旧到新轮转删除
+  retention_days: 0                  # 自动删除超过该天数的录像(0=永久保留);与 min_free_mb 一起防止占满盘
 
 mqtt:
   enabled: false
