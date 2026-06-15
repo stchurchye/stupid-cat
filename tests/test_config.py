@@ -70,6 +70,42 @@ def test_invalid_fusion_raises(tmp_path: Path) -> None:
         load_config(tmp_path / "config.yaml")
 
 
+def test_invalid_reid_backbone_raises(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        f"inference:\n  reid_backbone: resnet50\n{MINIMAL_CAMERAS}",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="reid_backbone"):
+        load_config(tmp_path / "config.yaml")
+
+
+def test_color_weight_out_of_range_raises(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        f"inference:\n  color_weight: 1.5\n{MINIMAL_CAMERAS}",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="color_weight"):
+        load_config(tmp_path / "config.yaml")
+
+
+def test_reid_topk_below_one_raises(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        f"inference:\n  reid_topk: 0\n{MINIMAL_CAMERAS}",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="reid_topk"):
+        load_config(tmp_path / "config.yaml")
+
+
+def test_dinov2_backbone_accepted(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        f"inference:\n  reid_backbone: dinov2_vits14\n{MINIMAL_CAMERAS}",
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.inference.reid_backbone == "dinov2_vits14"
+
+
 def test_unknown_config_key_raises(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(
         f"service:\n  prot: 8765\n{MINIMAL_CAMERAS}",

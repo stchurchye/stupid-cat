@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 import yaml
@@ -193,15 +194,38 @@ def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
     assert roi_half[2][1] == roi_full[2][1] / 2
 
 
-def test_set_centroid_is_copy_on_write(fast_pipeline: Pipeline) -> None:
-    fast_pipeline.centroids = {"a": np.ones(4, dtype=np.float32)}
-    snapshot = fast_pipeline.centroids
-    fast_pipeline._set_centroid("b", np.zeros(4, dtype=np.float32))
-    # The live dict gained the new key; the captured snapshot is untouched, so a
-    # concurrent reader iterating the snapshot can never see a mid-write mutation.
-    assert "b" in fast_pipeline.centroids
-    assert "b" not in snapshot
-    assert fast_pipeline.centroids is not snapshot
+def test_set_identity_and_remove_are_copy_on_write(fast_pipeline: Pipeline) -> None:
+    centroid = np.ones(4, dtype=np.float32)
+    gallery = np.ones((3, 4), dtype=np.float32)
+    color = np.ones((2, 960), dtype=np.float32)
+    galleries_before = fast_pipeline.galleries
+    fast_pipeline._set_identity("mimi", centroid, gallery, color)
+    assert "mimi" in fast_pipeline.galleries
+    assert "mimi" in fast_pipeline.color_galleries
+    assert galleries_before is not fast_pipeline.galleries  # rebound, not mutated
+    # A cat with no colourful refs drops out of color_galleries but keeps a gallery.
+    fast_pipeline._set_identity("mimi", centroid, gallery, None)
+    assert "mimi" in fast_pipeline.galleries
+    assert "mimi" not in fast_pipeline.color_galleries
+    # Removal clears all three maps.
+    fast_pipeline._remove_identity("mimi")
+    assert "mimi" not in fast_pipeline.centroids
+    assert "mimi" not in fast_pipeline.galleries
+
+
+def test_rebuild_identity_builds_gallery_from_refs(fast_pipeline: Pipeline) -> None:
+    fast_pipeline.cfg.cats.min_refs = 3
+    refs = fast_pipeline._data_dir / "cats" / "mimi" / "refs"
+    refs.mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    for i in range(3):
+        img = rng.integers(0, 255, (32, 32, 3), dtype=np.uint8)  # colourful, textured
+        cv2.imwrite(str(refs / f"v{i}_cam1.jpg"), img)
+    fast_pipeline._rebuild_identity_for("mimi")
+    assert "mimi" in fast_pipeline.galleries
+    assert fast_pipeline.galleries["mimi"].shape[0] == 3
+    assert (refs.parent / "gallery.npy").exists()
+    assert "mimi" in fast_pipeline.color_galleries  # colourful refs -> colour gallery
 
 
 def test_correct_visit_appends_ref(fast_pipeline: Pipeline, tmp_path: Path) -> None:
