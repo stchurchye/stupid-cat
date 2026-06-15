@@ -60,10 +60,13 @@ class RtspSource:
         url: str,
         *,
         reconnect_delay_sec: float = 5.0,
+        max_reconnect_delay_sec: float = 300.0,
     ) -> None:
         self.camera_id = camera_id
         self.url = url
         self.reconnect_delay_sec = reconnect_delay_sec
+        self.max_reconnect_delay_sec = max_reconnect_delay_sec
+        self._warned_no_timeout = False
 
     def _open(self) -> cv2.VideoCapture:
         # OPEN/READ timeouts are open-only properties: they must be passed in the
@@ -81,15 +84,36 @@ class RtspSource:
             try:
                 return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
             except Exception:  # noqa: BLE001 - any builds rejecting the 3-arg form fall back
-                pass
+                # Surface the fallback once: without timeout params a dead host can
+                # block open/read far longer, which on a shared executor can starve
+                # the sibling camera. Visible logging beats a silent hang.
+                if not self._warned_no_timeout:
+                    logger.warning(
+                        "%s: OpenCV rejected RTSP open/read timeout params; falling "
+                        "back to no-timeout open (a dead host may block longer)",
+                        self.camera_id,
+                    )
+                    self._warned_no_timeout = True
         return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
 
+    def _backoff_delay(self, attempt: int) -> float:
+        return min(self.reconnect_delay_sec * (2 ** attempt), self.max_reconnect_delay_sec)
+
     def frames(self) -> Iterator[np.ndarray]:
+        # Exponential backoff (base, 2x, ... capped at max) so an hour-long outage
+        # isn't an hour of busy 5s retries; a stream that connects and delivers a
+        # frame resets the backoff so a brief blip reconnects fast.
+        attempt = 0
         while True:
             cap = self._open()
             if not cap.isOpened():
-                logger.warning("RTSP open failed for %s, retry in %.0fs", self.camera_id, self.reconnect_delay_sec)
-                time.sleep(self.reconnect_delay_sec)
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "RTSP open failed for %s, retry in %.0fs (attempt %d)",
+                    self.camera_id, delay, attempt + 1,
+                )
+                time.sleep(delay)
+                attempt = min(attempt + 1, 16)
                 continue
             # Keep only the freshest frame (process live video, not a backlog).
             try:
@@ -97,16 +121,22 @@ class RtspSource:
             except cv2.error:
                 pass
             logger.info("RTSP connected: %s", self.camera_id)
+            got_frame = False
             try:
                 while True:
                     ok, frame = cap.read()
                     if not ok:
                         logger.warning("RTSP read ended for %s, reconnecting", self.camera_id)
                         break
+                    if not got_frame:
+                        got_frame = True
+                        attempt = 0  # healthy stream -> reset backoff
                     yield frame
             finally:
                 cap.release()
-            time.sleep(self.reconnect_delay_sec)
+            delay = self._backoff_delay(attempt)
+            time.sleep(delay)
+            attempt = min(attempt + 1, 16)
 
 
 def motion_score(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:

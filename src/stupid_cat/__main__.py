@@ -127,7 +127,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         if pipeline._thread:
             pipeline._thread.join()
     except KeyboardInterrupt:
-        pipeline.stop()
+        pass
+    finally:
+        pipeline.stop()  # always finalize: flush an active visit, release cameras
     return 0
 
 
@@ -164,17 +166,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
     port = pipeline.cfg.service.port
     print(f"Serving http://{host}:{port}/ (API + static)")
 
-    if sys.platform == "win32":
-        import asyncio
+    # uvicorn installs its own SIGINT/SIGTERM handlers and returns cleanly when
+    # signalled; the finally guarantees the pipeline is finalized (active visit
+    # flushed, cameras released) on a Windows-service stop or any error too.
+    try:
+        if sys.platform == "win32":
+            import asyncio
 
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="info")
-        server = uvicorn.Server(config)
-        asyncio.run(server.serve())
-    else:
-        uvicorn.run(app, host=host, port=port, log_level="info")
-    pipeline.stop()
+            config = uvicorn.Config(app, host=host, port=port, log_level="info")
+            server = uvicorn.Server(config)
+            asyncio.run(server.serve())
+        else:
+            uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        pipeline.stop()
     return 0
 
 
