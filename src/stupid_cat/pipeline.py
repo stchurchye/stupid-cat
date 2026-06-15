@@ -90,6 +90,9 @@ def _is_normalized_roi(roi: list) -> bool:
 # How many frames must show >=2 cats in-ROI before a visit is flagged multi-cat
 # (debounce against a single-frame YOLO box split).
 _MULTI_CAT_MIN_FRAMES = 3
+# For disjoint cameras, how recently each camera must have seen a cat for them to
+# count as "simultaneously occupied" (i.e. different cats in different views).
+_CROSS_CAM_WINDOW_SEC = 3.0
 
 
 class Pipeline:
@@ -181,6 +184,9 @@ class Pipeline:
         # >=2-cat streak is sustained; _multi_cat_streak is the current run length.
         self._peak_in_roi = 0
         self._multi_cat_streak = 0
+        # Per-camera last-qualified time (mono), for cross-camera multi-cat when
+        # cameras don't overlap.
+        self._cam_last_qualified: dict[str, float] = {}
         # Per-visit digging signal (primary camera, ROI region): (ts, motion)
         # samples, used to classify pee vs poop by late-phase frame-diff (spec §12).
         self._motion_samples: list[tuple[float, float]] = []
@@ -642,10 +648,22 @@ class Pipeline:
             # tally independently) stops a single YOLO box-split frame from
             # inflating the peak and mislabelling a lone cat as multi-cat.
             if visit_active:
-                if in_roi_count >= 2:
+                effective_count = in_roi_count
+                if not self.cfg.session.cameras_overlap:
+                    # Disjoint cameras: a cat present in N distinct views at once is
+                    # N cats, so fold concurrent-camera occupancy into the count.
+                    if qualified:
+                        self._cam_last_qualified[camera_id] = event.timestamp
+                    concurrent = sum(
+                        1
+                        for ts in self._cam_last_qualified.values()
+                        if event.timestamp - ts <= _CROSS_CAM_WINDOW_SEC
+                    )
+                    effective_count = max(in_roi_count, concurrent)
+                if effective_count >= 2:
                     self._multi_cat_streak += 1
                     if self._multi_cat_streak >= _MULTI_CAT_MIN_FRAMES:
-                        self._peak_in_roi = max(self._peak_in_roi, in_roi_count)
+                        self._peak_in_roi = max(self._peak_in_roi, effective_count)
                 else:
                     self._multi_cat_streak = 0
             # Digging signal for pee/poop (spec §12): frame-diff motion WITHIN the
@@ -741,6 +759,7 @@ class Pipeline:
         self._last_qualified_iso = self._visit_started_at
         self._peak_in_roi = 0
         self._multi_cat_streak = 0
+        self._cam_last_qualified = {}
         self._motion_samples = []
         self._digging_prev_gray = None
         self._visit_active.set()  # ingest now records at full fps until visit end

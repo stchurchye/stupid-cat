@@ -58,6 +58,8 @@ session:
   exit_no_cat_sec: 20.0      # 容忍猫转身/埋头十几秒不误判结束(时长按"最后一次看到猫"算,不会虚高)
   cooldown_sec: 3.0
   min_visit_sec: 3.0
+  cameras_overlap: true       # 两摄看同一个盆(默认):同一只猫被两路同时看到算一只。
+                              # 若两路各看不同区域(不重叠),改 false,才把"两路各有猫"判为多猫。
 
 preprocess:
   input_mode: "bgr"

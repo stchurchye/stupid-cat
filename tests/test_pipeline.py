@@ -740,3 +740,48 @@ def test_mqtt_visit_ended_published(fast_pipeline: Pipeline) -> None:
         fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
         t += 0.05
     assert any(topic.endswith("/visit_ended") for topic, _ in fake.msgs)
+
+
+def _dual_pipeline(tmp_path: Path, *, cameras_overlap: bool) -> Pipeline:
+    repo_cfg = Path(__file__).resolve().parents[1] / "config.yaml"
+    data = yaml.safe_load(repo_cfg.read_text(encoding="utf-8"))
+    data["session"].update(
+        enter_overlap_sec=0.05, exit_no_cat_sec=0.5, cooldown_sec=0.05,
+        min_visit_sec=0.01, cameras_overlap=cameras_overlap,
+    )
+    for c in data["cameras"]:
+        c["stream_width"], c["stream_height"] = 640, 480
+    data["recorder"]["record_cameras"] = ["cam1"]
+    p = tmp_path / "dual.yaml"
+    p.write_text(yaml.dump(data), encoding="utf-8")
+    cfg = load_config(p)
+    db = Database(tmp_path / "dual.db")
+    return Pipeline(cfg, db=db, data_dir=tmp_path / "data",
+                    detector=FakeDetector(), embedder=FakeEmbedder())
+
+
+def _run_two_cats_two_cameras(pipe: Pipeline) -> dict:
+    t = 0.0
+    for _ in range(12):  # one cat in cam1, another in cam2 (each view shows 1 box)
+        pipe._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+        pipe._process_frame(FrameEvent("cam2", _frame(), t))
+        t += 0.05
+    pipe.detector.in_roi = False
+    for _ in range(20):
+        pipe._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    return pipe.db.list_visits(only_ended=True)[0]
+
+
+def test_cross_camera_multicat_flagged_when_disjoint(tmp_path: Path) -> None:
+    visit = _run_two_cats_two_cameras(_dual_pipeline(tmp_path, cameras_overlap=False))
+    assert visit["max_cats"] >= 2
+    assert visit["multi_cat"] is True
+
+
+def test_overlapping_cameras_not_flagged_multicat(tmp_path: Path) -> None:
+    # Same input, but cameras share a view -> one cat seen twice, not two cats.
+    visit = _run_two_cats_two_cameras(_dual_pipeline(tmp_path, cameras_overlap=True))
+    assert visit["max_cats"] == 1
+    assert visit["multi_cat"] is False
