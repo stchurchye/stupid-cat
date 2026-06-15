@@ -1,0 +1,21 @@
+# systemd unit for stupid-cat (Linux auto-start + auto-restart).
+# Edit the two paths, then:
+#   sudo cp deploy/stupid-cat.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now stupid-cat
+# Logs:  journalctl -u stupid-cat -f
+[Unit]
+Description=stupid-cat litter vision monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stupid-cat
+ExecStart=/opt/stupid-cat/.venv/bin/python -m stupid_cat serve --config config.yaml --local-config config.local.yaml
+Restart=always
+RestartSec=5
+# Give an active visit time to finalize on stop (matches pipeline.stop join).
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

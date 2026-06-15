@@ -1,4 +1,37 @@
-# Operations: retention & backup
+# Operations: auto-start, retention & backup
+
+## Auto-start on boot (with auto-restart)
+
+The process handles SIGINT/SIGTERM gracefully (finalizes the active visit, releases
+cameras), so it's safe to run under a service manager that restarts it on crash.
+
+### Windows (Task Scheduler, runs at boot without login)
+
+From an **elevated** PowerShell in the project directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_service.ps1
+Start-ScheduledTask -TaskName stupid-cat       # start now without rebooting
+```
+
+It registers a task that runs `python -m stupid_cat serve` at startup as SYSTEM,
+restarting every minute on failure. Remove with
+`Unregister-ScheduledTask -TaskName stupid-cat -Confirm:$false`.
+(For a true Windows *service* with the same effect, NSSM also works:
+`nssm install stupid-cat <venv>\Scripts\python.exe -m stupid_cat serve`.)
+
+### Linux (systemd)
+
+Edit the paths in `deploy/stupid-cat.service`, then:
+
+```bash
+sudo cp deploy/stupid-cat.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now stupid-cat
+```
+
+---
+
+# Retention & backup
 
 ## Recording retention (automatic, in-process)
 
