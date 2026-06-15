@@ -7,6 +7,11 @@ $env:TMP = Join-Path $Root ".tmp"
 $env:TEMP = $env:TMP
 New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
 
+$ffmpegBin = Join-Path $Root "tools\ffmpeg\bin"
+if (Test-Path (Join-Path $ffmpegBin "ffmpeg.exe")) {
+    $env:PATH = "$ffmpegBin;$env:PATH"
+}
+
 $portLine = netstat -ano | Select-String ":8765" | Select-String "LISTENING" | Select-Object -First 1
 if ($portLine) {
     $procId = ($portLine -split "\s+")[-1]
