@@ -1,7 +1,10 @@
 service:
-  host: "127.0.0.1"
+  host: "127.0.0.1"            # 默认只监听本机;若要局域网访问改 0.0.0.0,并务必设下面的 api_key
   port: 8765
   pause_on_start: false
+  api_key: ""                  # 设为非空后,所有接口(除健康检查/登录)需 X-API-Key 头或登录;空=不鉴权
+  allowed_origins: []          # CORS 白名单;空=仅同源(默认安全)
+  trusted_hosts: ["*"]         # Host 头白名单;["*"] 关闭校验,绑 0.0.0.0 时建议填实际主机名/IP
 
 inference:
   device: "cpu"             # Win 生产在 config.local.yaml 覆盖为 cuda:0

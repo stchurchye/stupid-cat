@@ -207,3 +207,37 @@ def test_visit_exposes_digging_motion(client: TestClient, db: Database) -> None:
                  duration_sec=120, confidence=0.5, digging_motion=33.0)
     visits = client.get("/api/v1/visits").json()
     assert visits[0]["digging_motion"] == 33.0
+
+
+def test_api_key_auth_gate(tmp_path: Path) -> None:
+    cfg_path = Path(__file__).resolve().parents[1] / "config.yaml"
+    cfg = load_config(cfg_path)
+    cfg.service.api_key = "secret"
+    db = Database(tmp_path / "auth.db")
+    pipeline = Pipeline(cfg, db=db, data_dir=tmp_path / "data")
+    client = TestClient(create_app(pipeline, db))
+
+    assert client.get("/api/v1/health").status_code == 200  # health stays public
+    assert client.get("/api/v1/visits").status_code == 401  # no key -> blocked
+    assert client.get("/api/v1/visits", headers={"X-API-Key": "secret"}).status_code == 200
+    assert client.post("/api/v1/login", json={"key": "wrong"}).status_code == 401
+    assert client.post("/api/v1/login", json={"key": "secret"}).status_code == 200
+    # login set the sc_key cookie; TestClient resends it, so now it's allowed
+    assert client.get("/api/v1/visits").status_code == 200
+
+
+def test_no_auth_by_default(client: TestClient) -> None:
+    # Repo config has no api_key, so the API is open (localhost default).
+    assert client.get("/api/v1/visits").status_code == 200
+
+
+def test_trusted_host_rejects_bad_host(tmp_path: Path) -> None:
+    cfg_path = Path(__file__).resolve().parents[1] / "config.yaml"
+    cfg = load_config(cfg_path)
+    cfg.service.trusted_hosts = ["example.com"]
+    db = Database(tmp_path / "th.db")
+    pipeline = Pipeline(cfg, db=db, data_dir=tmp_path / "data")
+    client = TestClient(create_app(pipeline, db))
+    assert client.get("/api/v1/health").status_code == 400  # TestClient host != example.com
+    ok = client.get("/api/v1/health", headers={"host": "example.com"})
+    assert ok.status_code == 200
