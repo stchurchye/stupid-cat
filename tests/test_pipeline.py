@@ -245,6 +245,48 @@ def test_correct_visit_appends_dual_camera_refs(fast_pipeline: Pipeline, tmp_pat
     assert (refs_dir / f"{visit_id}_cam2.jpg").exists()
 
 
+def test_visit_active_flag_tracks_visit(fast_pipeline: Pipeline) -> None:
+    assert not fast_pipeline._visit_active.is_set()
+    t = 0.0
+    for _ in range(6):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    assert fast_pipeline._visit_active.is_set()  # full-fps recording while active
+
+    fast_pipeline.detector.in_roi = False
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    assert not fast_pipeline._visit_active.is_set()  # cleared once the visit ends
+
+
+def test_duration_uses_last_qualified_not_exit_timeout(fast_pipeline: Pipeline, monkeypatch) -> None:
+    import stupid_cat.pipeline as pmod
+    from datetime import datetime, timedelta, timezone
+
+    clock = {"t": 0}
+
+    def _fake_iso() -> str:
+        return (datetime(2026, 6, 15, tzinfo=timezone.utc) + timedelta(seconds=clock["t"])).isoformat(timespec="seconds")
+
+    monkeypatch.setattr(pmod, "_iso_now", _fake_iso)
+
+    ev = 0.0
+    for i in range(6):  # cat present, wall-clock seconds 0..5
+        clock["t"] = i
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), ev))
+        ev += 0.05
+    fast_pipeline.detector.in_roi = False
+    for j in range(10):  # cat gone; wall clock jumps far ahead during the no-cat tail
+        clock["t"] = 100 + j
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), ev))
+        ev += 0.05
+
+    visit = fast_pipeline.db.list_visits(only_ended=True)[0]
+    # Duration tracks actual presence (~5s), NOT the timeout moment (~100s).
+    assert visit["duration_sec"] <= 10
+
+
 def test_recorrection_moves_ref_between_cats(fast_pipeline: Pipeline, tmp_path: Path) -> None:
     visit_id = "visit-recorr"
     crop = np.zeros((100, 100, 3), dtype=np.uint8)

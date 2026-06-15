@@ -131,6 +131,12 @@ class Pipeline:
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
         self._consecutive_frame_errors = 0
+        # Set while a visit is active so ingest records at full fps (not throttled
+        # to idle by a still cat). Wall-clock time of the last qualified detection,
+        # used as the visit's true end so a larger exit_no_cat_sec doesn't inflate
+        # the reported duration.
+        self._visit_active = threading.Event()
+        self._last_qualified_iso: str | None = None
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -347,6 +353,7 @@ class Pipeline:
             active_fps=float(self.cfg.inference.active_fps),
             idle_fps=float(self.cfg.inference.idle_fps),
             motion_threshold=float(self.cfg.inference.motion_threshold),
+            is_active=self._visit_active.is_set,
         )
         self._ingest = ingest
         self._ingest_active = True
@@ -486,7 +493,10 @@ class Pipeline:
             qualified = overlap >= self.cfg.session.roi_overlap_min
 
         with self._lock:
-            self._last_frame_at[camera_id] = _iso_now()
+            now_iso = _iso_now()
+            self._last_frame_at[camera_id] = now_iso
+            if qualified:
+                self._last_qualified_iso = now_iso  # true presence end (any camera)
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
             visit_active = self.fsm.state == "active"
             visit_id = self.fsm.visit_id
@@ -566,6 +576,8 @@ class Pipeline:
         self._visit_started_at = _iso_now()
         self._best_correction_crops = {}
         self._best_correction_areas = {}
+        self._last_qualified_iso = None
+        self._visit_active.set()  # ingest now records at full fps until visit end
         # Decide once per visit whether to record (config + disk space).
         self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
         # Persist the visit at START so a crash mid-visit leaves a recoverable
@@ -589,6 +601,7 @@ class Pipeline:
         duration: float,
         discard: bool,
     ) -> None:
+        self._visit_active.clear()  # back to motion-gated idle fps
         # Skip the (background) browser re-encode when we're about to discard the
         # clip, so it can't race the unlink below.
         recording_paths = self._stop_visit_recorders(reencode=not discard)
@@ -652,7 +665,10 @@ class Pipeline:
             frames_used = 0
 
         started_at = self._visit_started_at or _iso_now()
-        ended_at = _iso_now()
+        # End the visit at the LAST time a cat was actually seen (any camera), not
+        # the no-cat-timeout moment, so widening exit_no_cat_sec to avoid splitting
+        # a turning cat doesn't inflate the reported duration.
+        ended_at = self._last_qualified_iso or _iso_now()
         duration_sec = _duration_seconds_wall(started_at, ended_at)
         camera_ids = sorted(self._camera_ids_seen)
 

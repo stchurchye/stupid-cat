@@ -352,6 +352,31 @@ def test_ref_quality_gate_robust_to_outlier_and_low_contrast() -> None:
 # --- ingest survives mid-stream frame-shape change --------------------------
 
 
+def test_rate_limited_is_active_forces_full_fps(monkeypatch) -> None:
+    import stupid_cat.ingest as ing
+
+    class _Src:
+        camera_id = "cam1"
+
+        def frames(self):
+            for _ in range(10):
+                yield np.zeros((8, 8, 3), dtype=np.uint8)  # zero motion -> idle
+
+    def _count(is_active):
+        times = iter([i * 0.2 for i in range(10)])
+        monkeypatch.setattr(ing.time, "monotonic", lambda: next(times))
+        # motion_threshold huge so motion never forces active; only is_active can.
+        return len(list(ing.rate_limited(
+            _Src(), active_fps=10.0, idle_fps=1.0, motion_threshold=999.0, is_active=is_active
+        )))
+
+    idle_emitted = _count(None)
+    active_emitted = _count(lambda: True)
+    # A still (zero-motion) stream emits at idle fps normally, but at full fps
+    # while a visit is active — so the active run yields strictly more frames.
+    assert active_emitted > idle_emitted
+
+
 def test_rate_limited_survives_frame_shape_change() -> None:
     class _Varying:
         camera_id = "cam1"

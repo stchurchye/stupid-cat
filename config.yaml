@@ -45,7 +45,7 @@ cameras:
 session:
   roi_overlap_min: 0.25
   enter_overlap_sec: 2.0
-  exit_no_cat_sec: 8.0
+  exit_no_cat_sec: 20.0      # 容忍猫转身/埋头十几秒不误判结束(时长按"最后一次看到猫"算,不会虚高)
   cooldown_sec: 3.0
   min_visit_sec: 3.0
 
