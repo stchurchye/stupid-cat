@@ -6,8 +6,12 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from stupid_cat.config import PreprocessConfig
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +162,7 @@ def fuse_embeddings(
         mode = "weighted_median"
 
     if mode == "weighted_mean":
-        w = np.asarray(weights, dtype=np.float32)
+        w: np.ndarray = np.asarray(weights, dtype=np.float32)
         total = w.sum()
         if total <= 0:
             w = np.ones(len(embs), dtype=np.float32) / len(embs)
@@ -249,7 +253,7 @@ def ref_quality_ok(frame: np.ndarray) -> bool:
 def build_centroid_from_refs(
     embedder: Embedder,
     refs_dir: Path,
-    preprocess_cfg: object,
+    preprocess_cfg: PreprocessConfig,
     min_refs: int,
 ) -> np.ndarray | None:
     """Mean L2-normalized embedding over ref images (spec §6.6).
@@ -314,7 +318,7 @@ def centroid_from_gallery(gallery: np.ndarray) -> np.ndarray:
 def build_gallery_from_refs(
     embedder: Embedder,
     refs_dir: Path,
-    preprocess_cfg: object,
+    preprocess_cfg: PreprocessConfig,
     min_refs: int,
     *,
     color_min_saturation: float = _COLOR_MIN_SATURATION,

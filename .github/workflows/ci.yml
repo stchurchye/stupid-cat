@@ -9,8 +9,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       # Light install: the heavy torch/ultralytics deps are imported lazily, so
@@ -25,6 +25,5 @@ jobs:
         run: ruff check src tests scripts
       - name: Tests
         run: pytest -m "not gpu" --cov=stupid_cat --cov-report=term-missing
-      - name: Type-check (mypy, non-blocking)
+      - name: Type-check (mypy)
         run: mypy --ignore-missing-imports src/stupid_cat
-        continue-on-error: true

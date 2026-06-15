@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp
 
 from stupid_cat.db import Database
 from stupid_cat.pipeline import Pipeline
@@ -55,7 +56,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
     the X-API-Key header or the sc_key cookie. A browser hitting an HTML page
     without the cookie is redirected to /login; programmatic clients get 401."""
 
-    def __init__(self, app: object, api_key: str) -> None:
+    def __init__(self, app: ASGIApp, api_key: str) -> None:
         super().__init__(app)
         self._api_key = api_key
 
