@@ -75,6 +75,7 @@ class Database:
                     camera_ids TEXT NOT NULL DEFAULT '[]',
                     recording_path TEXT,
                     corrected INTEGER NOT NULL DEFAULT 0,
+                    max_cats INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
 
@@ -91,6 +92,10 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_corrections_visit ON corrections(visit_id);
                 """
             )
+            # Migrate existing DBs that predate the max_cats column.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(visits)").fetchall()}
+            if "max_cats" not in cols:
+                conn.execute("ALTER TABLE visits ADD COLUMN max_cats INTEGER NOT NULL DEFAULT 1")
             conn.commit()
 
     def seed_cats(self, cats: list[dict[str, str]]) -> None:
@@ -146,6 +151,7 @@ class Database:
         frames_used: int = 0,
         camera_ids: list[str] | None = None,
         recording_path: str | None = None,
+        max_cats: int | None = None,
     ) -> None:
         with self._lock:
             conn = self._connection()
@@ -169,6 +175,8 @@ class Database:
                 updates["camera_ids"] = json.dumps(camera_ids)
             if recording_path is not None:
                 updates["recording_path"] = recording_path
+            if max_cats is not None:
+                updates["max_cats"] = max_cats
 
             set_clause = ", ".join(f"{col} = ?" for col in updates)
             conn.execute(
@@ -396,4 +404,7 @@ class Database:
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid camera_ids JSON for visit {data['id']}") from exc
         data["corrected"] = bool(data["corrected"])
+        # Derived flag: more than one cat was seen in the box during this visit,
+        # so the identity is unreliable (the FSM tracks a single occupant).
+        data["multi_cat"] = int(data.get("max_cats") or 1) >= 2
         return data

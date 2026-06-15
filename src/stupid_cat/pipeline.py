@@ -137,6 +137,7 @@ class Pipeline:
         # the reported duration.
         self._visit_active = threading.Event()
         self._last_qualified_iso: str | None = None
+        self._max_cats_seen = 0  # most cats simultaneously in-ROI during the visit
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -486,11 +487,13 @@ class Pipeline:
         boxes = self.detector.detect(frame, camera_id)
         primary = select_primary_bbox(boxes)
         qualified = False
+        in_roi_count = 0  # how many cats are simultaneously inside the ROI
         if primary is not None:
             h, w = frame.shape[:2]
             roi = self._roi_for_frame(camera_id, w, h)
-            overlap = bbox_roi_overlap_ratio(primary, roi)
-            qualified = overlap >= self.cfg.session.roi_overlap_min
+            thr = self.cfg.session.roi_overlap_min
+            qualified = bbox_roi_overlap_ratio(primary, roi) >= thr  # largest box (spec §8.4)
+            in_roi_count = sum(1 for b in boxes if bbox_roi_overlap_ratio(b, roi) >= thr)
 
         with self._lock:
             now_iso = _iso_now()
@@ -500,6 +503,8 @@ class Pipeline:
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
             visit_active = self.fsm.state == "active"
             visit_id = self.fsm.visit_id
+            if visit_active and in_roi_count > self._max_cats_seen:
+                self._max_cats_seen = in_roi_count  # flag multi-cat visits
             embed_work = visit_active and primary is not None
 
         with self._preview_lock:
@@ -577,6 +582,7 @@ class Pipeline:
         self._best_correction_crops = {}
         self._best_correction_areas = {}
         self._last_qualified_iso = None
+        self._max_cats_seen = 0
         self._visit_active.set()  # ingest now records at full fps until visit end
         # Decide once per visit whether to record (config + disk space).
         self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
@@ -671,6 +677,7 @@ class Pipeline:
         ended_at = self._last_qualified_iso or _iso_now()
         duration_sec = _duration_seconds_wall(started_at, ended_at)
         camera_ids = sorted(self._camera_ids_seen)
+        max_cats = max(1, self._max_cats_seen)
 
         def _finalize() -> None:
             self.db.end_visit(
@@ -682,6 +689,7 @@ class Pipeline:
                 frames_used=frames_used,
                 camera_ids=camera_ids,
                 recording_path=str(recording_path) if recording_path else None,
+                max_cats=max_cats,
             )
 
         # The row was created at visit start; if it is somehow missing (start
@@ -699,7 +707,14 @@ class Pipeline:
 
         self._visit_started_at = None
         self._embedding_buffer = None
-        logger.info("visit ended %s cat=%s conf=%.2f", visit_id, cat_id, confidence)
+        logger.info(
+            "visit ended %s cat=%s conf=%.2f max_cats=%d", visit_id, cat_id, confidence, max_cats
+        )
+        if max_cats >= 2:
+            logger.warning(
+                "visit %s saw %d cats in the box at once — identity is unreliable",
+                visit_id, max_cats,
+            )
 
     def _set_centroid(self, cat_id: str, centroid: np.ndarray) -> None:
         """Replace the centroids dict atomically (copy-on-write).
