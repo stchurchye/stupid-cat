@@ -23,6 +23,14 @@ class ServiceConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     pause_on_start: bool = False
+    # Optional shared-secret gate. Empty = no auth (fine on the default localhost
+    # bind). When set, every request except health/login needs the key via an
+    # X-API-Key header or the sc_key cookie — set this before binding to 0.0.0.0.
+    api_key: str = ""
+    # CORS allow-list; empty means no CORS middleware (same-origin only, the safe
+    # default). TrustedHost allow-list for the Host header; ["*"] disables the check.
+    allowed_origins: list[str] = field(default_factory=list)
+    trusted_hosts: list[str] = field(default_factory=lambda: ["*"])
 
 
 @dataclass
@@ -300,6 +308,11 @@ def validate_config(cfg: AppConfig) -> None:
         raise ConfigError(
             f"preprocess.input_mode must be one of {sorted(INPUT_MODES)}, "
             f"got {cfg.preprocess.input_mode!r}"
+        )
+
+    if not cfg.service.trusted_hosts:
+        raise ConfigError(
+            "service.trusted_hosts must not be empty (use ['*'] to disable the Host check)"
         )
 
 

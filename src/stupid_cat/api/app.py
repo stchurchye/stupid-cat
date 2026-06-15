@@ -4,15 +4,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from stupid_cat.db import Database
 from stupid_cat.pipeline import Pipeline
 from stupid_cat.recorder import visit_recording_filename
 from stupid_cat.timeutil import local_iso_cutoff
+
+# Reachable without the API key so health probes work and the login page can load.
+_AUTH_PUBLIC_PATHS = frozenset({"/api/v1/health", "/login", "/api/v1/login"})
+_AUTH_COOKIE = "sc_key"
+
+_LOGIN_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>stupid-cat 登录</title>
+<style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0;background:#0f172a;color:#e2e8f0}
+form{background:#1e293b;padding:24px;border-radius:10px;display:flex;flex-direction:column;gap:12px;min-width:260px}
+input,button{padding:10px;border-radius:6px;border:1px solid #334155;font-size:1em}
+button{background:#2563eb;color:#fff;border:none;cursor:pointer}#err{color:#f87171;font-size:.9em;min-height:1em}</style>
+</head><body><form id="f"><h2>🐱 需要访问密钥</h2>
+<input id="k" type="password" placeholder="API key" autofocus autocomplete="current-password">
+<div id="err"></div><button type="submit">进入</button></form>
+<script>document.getElementById('f').addEventListener('submit',async e=>{e.preventDefault();
+const r=await fetch('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({key:document.getElementById('k').value})});
+if(r.ok){location.href='/';}else{document.getElementById('err').textContent='密钥错误';}});</script>
+</body></html>"""
 
 
 class CorrectVisitBody(BaseModel):
@@ -21,6 +44,31 @@ class CorrectVisitBody(BaseModel):
 
 class WasteBody(BaseModel):
     waste_type: str
+
+
+class LoginBody(BaseModel):
+    key: str
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Gate every request (except health/login) behind a shared key supplied via
+    the X-API-Key header or the sc_key cookie. A browser hitting an HTML page
+    without the cookie is redirected to /login; programmatic clients get 401."""
+
+    def __init__(self, app: object, api_key: str) -> None:
+        super().__init__(app)
+        self._api_key = api_key
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        path = request.url.path
+        if path in _AUTH_PUBLIC_PATHS:
+            return await call_next(request)
+        supplied = request.headers.get("X-API-Key") or request.cookies.get(_AUTH_COOKIE)
+        if supplied != self._api_key:
+            if "text/html" in request.headers.get("accept", ""):
+                return RedirectResponse("/login")
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return await call_next(request)
 
 
 def _visit_recordings(pipeline: Pipeline, visit: dict) -> list[dict[str, str]]:
@@ -56,6 +104,39 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
     app = FastAPI(title="stupid-cat")
     static_dir = Path(__file__).resolve().parent.parent / "web" / "static"
     recordings_dir = pipeline.recordings_dir
+    svc = pipeline.cfg.service
+
+    # Reject spoofed Host headers (DNS-rebinding) unless explicitly disabled.
+    if svc.trusted_hosts and svc.trusted_hosts != ["*"]:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=svc.trusted_hosts)
+    # CORS only when origins are configured; default is same-origin only.
+    if svc.allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=svc.allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    # Optional shared-secret gate (no-op when api_key is empty).
+    if svc.api_key:
+        app.add_middleware(ApiKeyMiddleware, api_key=svc.api_key)
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return _LOGIN_HTML
+
+    @app.post("/api/v1/login")
+    def login(body: LoginBody) -> Response:
+        if not svc.api_key or body.key != svc.api_key:
+            raise HTTPException(status_code=401, detail="invalid key")
+        resp = JSONResponse({"ok": True})
+        # httponly so page JS can't leak it; sent automatically on same-origin
+        # fetch()/video requests, so the bundled UI works once logged in.
+        resp.set_cookie(
+            _AUTH_COOKIE, svc.api_key, httponly=True, samesite="lax", max_age=30 * 86400
+        )
+        return resp
 
     @app.get("/api/v1/health")
     def health() -> dict:
