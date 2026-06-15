@@ -244,12 +244,16 @@ def validate_config(cfg: AppConfig) -> None:
             f"must be an enabled camera, one of {enabled_ids}"
         )
 
-    if cfg.recorder.record_cameras is not None:
+    if cfg.recorder.enabled and cfg.recorder.record_cameras is not None:
+        # Reject typos (ids that don't exist) but allow a currently-disabled
+        # camera to remain listed — record_camera_ids() filters disabled ones at
+        # runtime. Only checked when recording is on (else record_cameras is
+        # unused, like primary_camera above).
         for cam_id in cfg.recorder.record_cameras:
-            if cam_id not in enabled_ids:
+            if cam_id not in camera_ids:
                 raise ConfigError(
-                    f"recorder.record_cameras contains '{cam_id}' "
-                    f"which is not an enabled camera; enabled: {enabled_ids}"
+                    f"recorder.record_cameras contains unknown camera '{cam_id}'; "
+                    f"known cameras: {camera_ids}"
                 )
 
     if cfg.inference.fusion not in FUSION_MODES:

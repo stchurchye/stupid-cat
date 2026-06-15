@@ -40,6 +40,9 @@ def fast_pipeline(tmp_path: Path) -> Pipeline:
     data["session"]["cooldown_sec"] = 0.05
     data["session"]["min_visit_sec"] = 0.01
     data["cameras"] = [data["cameras"][0]]
+    # This fixture runs a single camera; keep record_cameras consistent with it
+    # (the shipped config records both cam1+cam2).
+    data["recorder"]["record_cameras"] = ["cam1"]
     # Test frames are 640x480; match the camera's calibration resolution so the
     # ROI (authored in stream coords) maps 1:1 onto the frame (spec §7.3).
     data["cameras"][0]["stream_width"] = 640

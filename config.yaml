@@ -57,7 +57,8 @@ preprocess:
 recorder:
   enabled: true
   primary_camera: "cam1"
-  max_seconds: 30
+  record_cameras: ["cam1", "cam2"]   # 录两路视角(主+辅);只想录主摄就删掉这行
+  max_seconds: 300                   # 录像片段上限(秒);时长记录不受此限,始终是完整墙钟
 
 mqtt:
   enabled: false
