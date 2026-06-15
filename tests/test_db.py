@@ -247,3 +247,28 @@ def test_clear_recording_paths(tmp_path: Path) -> None:
     db.clear_recording_paths([vid])
     assert db.get_visit(vid)["recording_path"] is None
 
+
+
+def test_end_visit_stores_digging_motion(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(
+        vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+        duration_sec=120, confidence=0.5, digging_motion=42.5,
+    )
+    assert db.get_visit(vid)["digging_motion"] == 42.5
+
+
+def test_set_waste_logs_correction_and_accuracy(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(
+        vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+        duration_sec=120, confidence=0.5, waste_type="pee", waste_confidence=0.6,
+    )
+    db.set_waste_type(vid, "poop")  # heuristic said pee, human says poop
+    acc = db.waste_accuracy()
+    assert acc["total_corrections"] == 1
+    assert acc["confusion"]["pee->poop"] == 1
+    db.set_waste_type(vid, "poop")  # no change -> not logged again
+    assert db.waste_accuracy()["total_corrections"] == 1

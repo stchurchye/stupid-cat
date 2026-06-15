@@ -76,6 +76,7 @@ class Database:
                     recording_path TEXT,
                     corrected INTEGER NOT NULL DEFAULT 0,
                     max_cats INTEGER NOT NULL DEFAULT 1,
+                    digging_motion REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -87,15 +88,25 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS waste_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    visit_id TEXT NOT NULL REFERENCES visits(id),
+                    old_waste_type TEXT NOT NULL,
+                    new_waste_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_visits_started_at ON visits(started_at);
                 CREATE INDEX IF NOT EXISTS idx_visits_cat_started ON visits(cat_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_corrections_visit ON corrections(visit_id);
                 """
             )
-            # Migrate existing DBs that predate the max_cats column.
+            # Migrate existing DBs that predate later columns.
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(visits)").fetchall()}
             if "max_cats" not in cols:
                 conn.execute("ALTER TABLE visits ADD COLUMN max_cats INTEGER NOT NULL DEFAULT 1")
+            if "digging_motion" not in cols:
+                conn.execute("ALTER TABLE visits ADD COLUMN digging_motion REAL NOT NULL DEFAULT 0")
             conn.commit()
 
     def seed_cats(self, cats: list[dict[str, str]]) -> None:
@@ -154,6 +165,7 @@ class Database:
         max_cats: int | None = None,
         waste_type: str | None = None,
         waste_confidence: float | None = None,
+        digging_motion: float | None = None,
     ) -> None:
         with self._lock:
             conn = self._connection()
@@ -182,6 +194,8 @@ class Database:
             if waste_type is not None:
                 updates["waste_type"] = waste_type
                 updates["waste_confidence"] = waste_confidence or 0.0
+            if digging_motion is not None:
+                updates["digging_motion"] = digging_motion
 
             set_clause = ", ".join(f"{col} = ?" for col in updates)
             conn.execute(
@@ -307,17 +321,48 @@ class Database:
             conn.commit()
 
     def set_waste_type(self, visit_id: str, waste_type: str) -> None:
-        """Manually override the pee/poop classification for a visit."""
+        """Manually override the pee/poop classification for a visit.
+
+        Logs the predicted->corrected change in waste_corrections so the heuristic's
+        accuracy can be reviewed and its thresholds tuned against real outcomes."""
         with self._lock:
             conn = self._connection()
-            row = conn.execute("SELECT id FROM visits WHERE id = ?", (visit_id,)).fetchone()
+            row = conn.execute(
+                "SELECT waste_type FROM visits WHERE id = ?", (visit_id,)
+            ).fetchone()
             if row is None:
                 raise KeyError(f"visit not found: {visit_id}")
+            old_waste = row["waste_type"]
             conn.execute(
                 "UPDATE visits SET waste_type = ?, waste_confidence = 1.0 WHERE id = ?",
                 (waste_type, visit_id),
             )
+            if old_waste != waste_type:
+                conn.execute(
+                    """
+                    INSERT INTO waste_corrections
+                        (visit_id, old_waste_type, new_waste_type, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (visit_id, old_waste, waste_type, _utc_now_iso()),
+                )
             conn.commit()
+
+    def waste_accuracy(self) -> dict[str, Any]:
+        """Predicted-vs-corrected summary so the pee/poop thresholds can be tuned.
+
+        ``confusion`` maps 'predicted->actual' to the number of times the operator
+        corrected a heuristic prediction that way (e.g. 'pee->poop': 12 means the
+        heuristic called pee but it was poop 12 times)."""
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT old_waste_type, new_waste_type FROM waste_corrections"
+            ).fetchall()
+        confusion: dict[str, int] = {}
+        for r in rows:
+            key = f"{r['old_waste_type']}->{r['new_waste_type']}"
+            confusion[key] = confusion.get(key, 0) + 1
+        return {"total_corrections": len(rows), "confusion": confusion}
 
     def list_corrections(self, *, visit_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

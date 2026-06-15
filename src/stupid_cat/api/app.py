@@ -137,6 +137,11 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True, "visit_id": visit_id, "waste_type": body.waste_type}
 
+    @app.get("/api/v1/waste/accuracy")
+    def waste_accuracy() -> dict:
+        """Predicted-vs-corrected pee/poop summary for tuning the heuristic."""
+        return db.waste_accuracy()
+
     @app.post("/api/v1/cats/{cat_id}/rebuild-embedding")
     def rebuild_embedding(cat_id: str) -> dict:
         if not pipeline.rebuild_cat_centroid(cat_id):
