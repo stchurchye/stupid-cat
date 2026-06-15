@@ -142,6 +142,10 @@ function renderCatTable(rows, totalVisits) {
 
 async function getJSON(url) {
   const res = await fetch(url);
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("unauthorized");
+  }
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json();
 }

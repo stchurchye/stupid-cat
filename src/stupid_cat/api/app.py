@@ -53,8 +53,8 @@ class LoginBody(BaseModel):
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     """Gate every request (except health/login) behind a shared key supplied via
-    the X-API-Key header or the sc_key cookie. A browser hitting an HTML page
-    without the cookie is redirected to /login; programmatic clients get 401."""
+    the X-API-Key header or the sc_key cookie. API/recordings paths get a 401 (so
+    fetch() clients can handle it); page navigations are redirected to /login."""
 
     def __init__(self, app: ASGIApp, api_key: str) -> None:
         super().__init__(app)
@@ -62,13 +62,18 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.url.path
-        if path in _AUTH_PUBLIC_PATHS:
+        # OPTIONS preflights carry no credentials and are answered by CORS; never
+        # gate them, or cross-origin requests break when api_key is also set.
+        if request.method == "OPTIONS" or path in _AUTH_PUBLIC_PATHS:
             return await call_next(request)
         supplied = request.headers.get("X-API-Key") or request.cookies.get(_AUTH_COOKIE)
         if supplied != self._api_key:
-            if "text/html" in request.headers.get("accept", ""):
-                return RedirectResponse("/login")
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+            # Branch on the resource, not the Accept header: API/recordings clients
+            # (fetch/XHR/<video>) get 401 to handle; page loads bounce to /login
+            # with 303 so a POST isn't replayed against the GET-only login page.
+            if path.startswith("/api/") or path.startswith("/recordings"):
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+            return RedirectResponse("/login", status_code=303)
         return await call_next(request)
 
 
@@ -107,9 +112,12 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
     recordings_dir = pipeline.recordings_dir
     svc = pipeline.cfg.service
 
-    # Reject spoofed Host headers (DNS-rebinding) unless explicitly disabled.
-    if svc.trusted_hosts and svc.trusted_hosts != ["*"]:
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=svc.trusted_hosts)
+    # add_middleware prepends, so the LAST added is outermost. Add inner-to-outer
+    # to get the request flow TrustedHost -> CORS -> ApiKey -> app, so CORS answers
+    # preflights before the key gate and Host is checked first.
+    # Optional shared-secret gate (innermost; no-op when api_key is empty).
+    if svc.api_key:
+        app.add_middleware(ApiKeyMiddleware, api_key=svc.api_key)
     # CORS only when origins are configured; default is same-origin only.
     if svc.allowed_origins:
         app.add_middleware(
@@ -119,9 +127,9 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-    # Optional shared-secret gate (no-op when api_key is empty).
-    if svc.api_key:
-        app.add_middleware(ApiKeyMiddleware, api_key=svc.api_key)
+    # Reject spoofed Host headers (DNS-rebinding) unless explicitly disabled (outermost).
+    if svc.trusted_hosts and svc.trusted_hosts != ["*"]:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=svc.trusted_hosts)
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> str:
