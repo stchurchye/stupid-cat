@@ -165,6 +165,7 @@ class Pipeline:
         self._preview_ts: dict[str, float] = {}
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
+        self._last_retention_mono = 0.0
         self._consecutive_frame_errors = 0
         # Set while a visit is active so ingest records at full fps (not throttled
         # to idle by a still cat). Wall-clock time of the last qualified detection,
@@ -417,6 +418,7 @@ class Pipeline:
             for event in ingest.events():
                 if self._stop.is_set():
                     break
+                self._maybe_run_retention()  # cheap; throttled internally
                 if event is None:
                     # Heartbeat during an outage: let the FSM time out an active
                     # visit even though no frames are arriving.
@@ -464,6 +466,66 @@ class Pipeline:
                 self.cfg.recorder.min_free_mb,
             )
         return False
+
+    _RETENTION_INTERVAL_SEC = 600.0  # run the rotation pass at most every 10 min
+
+    def _maybe_run_retention(self) -> None:
+        now = _mono_now()
+        if now - self._last_retention_mono < self._RETENTION_INTERVAL_SEC:
+            return
+        self._last_retention_mono = now
+        try:
+            self._retention_pass()
+        except Exception:  # noqa: BLE001 - retention must never kill ingest
+            logger.exception("retention pass failed")
+
+    def _retention_pass(self) -> None:
+        """Delete clips older than retention_days, then (if still low on space)
+        the oldest clips until min_free_mb is satisfied. Clears any DB
+        recording_path that pointed at a deleted primary clip."""
+        rec = self.recordings_dir
+        if not rec.is_dir():
+            return
+        removed: list[str] = []
+
+        days = self.cfg.recorder.retention_days
+        if days > 0:
+            cutoff = time.time() - days * 86400
+            for p in list(rec.glob("*.mp4")):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        removed.append(p.stem)
+                except OSError:
+                    pass
+
+        min_free = self.cfg.recorder.min_free_mb * 1024 * 1024
+        if min_free > 0:
+            try:
+                free = shutil.disk_usage(self._data_dir).free
+            except OSError:
+                free = min_free  # can't tell -> skip free-space rotation
+            if free < min_free:
+                # Oldest first; delete until back above the threshold.
+                clips = sorted(rec.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+                for p in clips:
+                    if free >= min_free:
+                        break
+                    try:
+                        size = p.stat().st_size
+                        p.unlink()
+                        removed.append(p.stem)
+                        free += size
+                    except OSError:
+                        pass
+
+        if removed:
+            # Stems of secondary clips ('{id}_cam2') simply won't match any id.
+            try:
+                self.db.clear_recording_paths(list(set(removed)))
+            except Exception:  # noqa: BLE001
+                logger.exception("could not clear recording paths after retention")
+            logger.info("retention removed %d clip file(s)", len(removed))
 
     def _correction_crop_path(self, visit_id: str, camera_id: str) -> Path:
         return self._data_dir / "correction_crops" / f"{visit_id}_{camera_id}.jpg"
