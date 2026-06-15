@@ -75,6 +75,7 @@ class Database:
                     camera_ids TEXT NOT NULL DEFAULT '[]',
                     recording_path TEXT,
                     corrected INTEGER NOT NULL DEFAULT 0,
+                    max_cats INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
 
@@ -91,6 +92,10 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_corrections_visit ON corrections(visit_id);
                 """
             )
+            # Migrate existing DBs that predate the max_cats column.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(visits)").fetchall()}
+            if "max_cats" not in cols:
+                conn.execute("ALTER TABLE visits ADD COLUMN max_cats INTEGER NOT NULL DEFAULT 1")
             conn.commit()
 
     def seed_cats(self, cats: list[dict[str, str]]) -> None:
@@ -146,6 +151,9 @@ class Database:
         frames_used: int = 0,
         camera_ids: list[str] | None = None,
         recording_path: str | None = None,
+        max_cats: int | None = None,
+        waste_type: str | None = None,
+        waste_confidence: float | None = None,
     ) -> None:
         with self._lock:
             conn = self._connection()
@@ -169,6 +177,11 @@ class Database:
                 updates["camera_ids"] = json.dumps(camera_ids)
             if recording_path is not None:
                 updates["recording_path"] = recording_path
+            if max_cats is not None:
+                updates["max_cats"] = max_cats
+            if waste_type is not None:
+                updates["waste_type"] = waste_type
+                updates["waste_confidence"] = waste_confidence or 0.0
 
             set_clause = ", ".join(f"{col} = ?" for col in updates)
             conn.execute(
@@ -235,15 +248,20 @@ class Database:
         to_ts: str | None = None,
         cat_id: str | None = None,
         only_ended: bool = False,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
 
+        # Compare via SQLite datetime(): it parses the ISO offset and normalizes
+        # to UTC, so a from_ts/to_ts in a different offset than the stored
+        # timestamps still filters by the correct instant (a raw string >= would
+        # be lexicographic and wrong across offsets).
         if from_ts is not None:
-            clauses.append("started_at >= ?")
+            clauses.append("datetime(started_at) >= datetime(?)")
             params.append(from_ts)
         if to_ts is not None:
-            clauses.append("started_at <= ?")
+            clauses.append("datetime(started_at) <= datetime(?)")
             params.append(to_ts)
         if cat_id is not None:
             clauses.append("cat_id = ?")
@@ -252,7 +270,12 @@ class Database:
             clauses.append("ended_at IS NOT NULL")
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT * FROM visits {where} ORDER BY started_at DESC"
+        # Order by the parsed instant (offset-aware) so a LIMIT slice returns the
+        # truly most-recent rows even when stored timestamps mix UTC offsets.
+        sql = f"SELECT * FROM visits {where} ORDER BY datetime(started_at) DESC"
+        if limit is not None and limit >= 0:
+            sql += " LIMIT ?"
+            params.append(limit)
         with self._lock:
             rows = self._connection().execute(sql, params).fetchall()
         return [self._row_to_visit(r) for r in rows]
@@ -280,6 +303,19 @@ class Database:
                 VALUES (?, ?, ?, ?)
                 """,
                 (visit_id, old_cat_id, new_cat_id, _utc_now_iso()),
+            )
+            conn.commit()
+
+    def set_waste_type(self, visit_id: str, waste_type: str) -> None:
+        """Manually override the pee/poop classification for a visit."""
+        with self._lock:
+            conn = self._connection()
+            row = conn.execute("SELECT id FROM visits WHERE id = ?", (visit_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"visit not found: {visit_id}")
+            conn.execute(
+                "UPDATE visits SET waste_type = ?, waste_confidence = 1.0 WHERE id = ?",
+                (waste_type, visit_id),
             )
             conn.commit()
 
@@ -388,4 +424,7 @@ class Database:
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid camera_ids JSON for visit {data['id']}") from exc
         data["corrected"] = bool(data["corrected"])
+        # Derived flag: more than one cat was seen in the box during this visit,
+        # so the identity is unreliable (the FSM tracks a single occupant).
+        data["multi_cat"] = int(data.get("max_cats") or 1) >= 2
         return data

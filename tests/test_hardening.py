@@ -98,6 +98,101 @@ def test_finalize_orphan_visits_closes_open_rows(tmp_path: Path) -> None:
     db.close()
 
 
+def test_list_visits_time_filter_is_offset_aware(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    # Stored in +08:00 (09:00+08 == 01:00 UTC).
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00",
+                 duration_sec=300, confidence=0.0)
+    # A UTC window that DOES contain the instant -> returned.
+    inside = db.list_visits(from_ts="2026-06-15T00:30:00+00:00",
+                            to_ts="2026-06-15T01:30:00+00:00", only_ended=True)
+    assert [r["id"] for r in inside] == [vid]
+    # A UTC window that does NOT contain the instant, but WOULD if compared as raw
+    # strings ('...09:00:00+08:00' >= '...08:30:00+00:00' lexicographically).
+    outside = db.list_visits(from_ts="2026-06-15T08:30:00+00:00",
+                             to_ts="2026-06-15T10:00:00+00:00", only_ended=True)
+    assert outside == []
+    db.close()
+
+
+def test_list_visits_ordered_by_instant_not_string(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    # A is the NEWER instant (02:00 UTC) but sorts EARLIER lexicographically than
+    # B's raw string (09:00+08 == 01:00 UTC, the older instant).
+    a = db.create_visit(cat_id="unknown", started_at="2026-06-15T02:00:00+00:00")
+    db.end_visit(a, cat_id="unknown", ended_at="2026-06-15T02:05:00+00:00", duration_sec=300, confidence=0.0)
+    b = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(b, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00", duration_sec=300, confidence=0.0)
+    newest = db.list_visits(only_ended=True, limit=1)
+    assert [r["id"] for r in newest] == [a]  # most-recent instant, not lexicographic
+    db.close()
+
+
+def test_max_cats_persisted_and_multi_cat_flag(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00",
+                 duration_sec=300, confidence=0.0, max_cats=2)
+    row = db.get_visit(vid)
+    assert row["max_cats"] == 2
+    assert row["multi_cat"] is True
+
+    vid2 = db.create_visit(cat_id="mimi", started_at="2026-06-15T10:00:00+08:00")
+    db.end_visit(vid2, cat_id="mimi", ended_at="2026-06-15T10:01:00+08:00",
+                 duration_sec=60, confidence=0.5)
+    row2 = db.get_visit(vid2)
+    assert row2["max_cats"] == 1
+    assert row2["multi_cat"] is False
+    db.close()
+
+
+def test_max_cats_migration_on_pre_existing_db(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE visits (id TEXT PRIMARY KEY, cat_id TEXT NOT NULL, "
+        "started_at TEXT NOT NULL, ended_at TEXT, duration_sec INTEGER, "
+        "confidence REAL NOT NULL DEFAULT 0, waste_type TEXT NOT NULL DEFAULT 'unknown', "
+        "waste_confidence REAL NOT NULL DEFAULT 0, frames_used INTEGER NOT NULL DEFAULT 0, "
+        "camera_ids TEXT NOT NULL DEFAULT '[]', recording_path TEXT, "
+        "corrected INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO visits (id, cat_id, started_at, ended_at, duration_sec, created_at) "
+        "VALUES ('v1','unknown','2026-06-15T09:00:00+08:00','2026-06-15T09:01:00+08:00',60,"
+        "'2026-06-15T01:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    db.init_schema()  # must ALTER the pre-existing table to add max_cats
+    row = db.get_visit("v1")
+    assert row["max_cats"] == 1  # default backfill
+    assert row["multi_cat"] is False
+    db.close()
+
+
+def test_set_waste_type(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-15T09:02:00+08:00",
+                 duration_sec=120, confidence=0.5)
+    assert db.get_visit(vid)["waste_type"] == "unknown"
+    db.set_waste_type(vid, "poop")
+    row = db.get_visit(vid)
+    assert row["waste_type"] == "poop"
+    assert row["waste_confidence"] == 1.0
+    db.close()
+
+
 def test_delete_visit_removes_row_and_corrections(tmp_path: Path) -> None:
     db = Database(tmp_path / "t.db")
     db.init_schema()
@@ -331,6 +426,31 @@ def test_ref_quality_gate_robust_to_outlier_and_low_contrast() -> None:
 
 
 # --- ingest survives mid-stream frame-shape change --------------------------
+
+
+def test_rate_limited_is_active_forces_full_fps(monkeypatch) -> None:
+    import stupid_cat.ingest as ing
+
+    class _Src:
+        camera_id = "cam1"
+
+        def frames(self):
+            for _ in range(10):
+                yield np.zeros((8, 8, 3), dtype=np.uint8)  # zero motion -> idle
+
+    def _count(is_active):
+        times = iter([i * 0.2 for i in range(10)])
+        monkeypatch.setattr(ing.time, "monotonic", lambda: next(times))
+        # motion_threshold huge so motion never forces active; only is_active can.
+        return len(list(ing.rate_limited(
+            _Src(), active_fps=10.0, idle_fps=1.0, motion_threshold=999.0, is_active=is_active
+        )))
+
+    idle_emitted = _count(None)
+    active_emitted = _count(lambda: True)
+    # A still (zero-motion) stream emits at idle fps normally, but at full fps
+    # while a visit is active — so the active run yields strictly more frames.
+    assert active_emitted > idle_emitted
 
 
 def test_rate_limited_survives_frame_shape_change() -> None:

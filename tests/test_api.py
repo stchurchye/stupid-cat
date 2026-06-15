@@ -77,6 +77,17 @@ def test_correct_visit_delegates_to_pipeline(client: TestClient, db: Database) -
     assert db.get_visit(vid)["cat_id"] == "mimi"
 
 
+def test_set_waste_endpoint(client: TestClient, db: Database) -> None:
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+                 duration_sec=120, confidence=0.5)
+    res = client.post(f"/api/v1/visits/{vid}/waste", json={"waste_type": "poop"})
+    assert res.status_code == 200
+    assert db.get_visit(vid)["waste_type"] == "poop"
+    bad = client.post(f"/api/v1/visits/{vid}/waste", json={"waste_type": "blood"})
+    assert bad.status_code == 400
+
+
 def test_cats_and_visits(client: TestClient, db: Database) -> None:
     vid = db.create_visit(cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
     db.end_visit(
@@ -165,9 +176,12 @@ def test_camera_preview_returns_jpeg(tmp_path: Path) -> None:
     cfg_path = Path(__file__).resolve().parents[1] / "config.yaml"
     cfg = load_config(cfg_path)
     db = Database(tmp_path / "test.db")
+    import time as _time
+
     pipeline = Pipeline(cfg, db=db, data_dir=tmp_path / "data")
     with pipeline._preview_lock:
         pipeline._preview_frames["cam1"] = np.zeros((120, 160, 3), dtype=np.uint8)
+        pipeline._preview_ts["cam1"] = _time.monotonic()  # fresh, else staleness-gated
 
     app = create_app(pipeline, db)
     client = TestClient(app)

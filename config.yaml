@@ -45,7 +45,7 @@ cameras:
 session:
   roi_overlap_min: 0.25
   enter_overlap_sec: 2.0
-  exit_no_cat_sec: 8.0
+  exit_no_cat_sec: 20.0      # 容忍猫转身/埋头十几秒不误判结束(时长按"最后一次看到猫"算,不会虚高)
   cooldown_sec: 3.0
   min_visit_sec: 3.0
 
@@ -57,7 +57,8 @@ preprocess:
 recorder:
   enabled: true
   primary_camera: "cam1"
-  max_seconds: 30
+  record_cameras: ["cam1", "cam2"]   # 录两路视角(主+辅);只想录主摄就删掉这行
+  max_seconds: 300                   # 录像片段上限(秒);时长记录不受此限,始终是完整墙钟
 
 mqtt:
   enabled: false
@@ -68,7 +69,8 @@ mqtt:
   password: ""
 
 waste:
-  enabled: false
-  pee_max_duration_sec: 90
-  poop_min_duration_sec: 120
-  dig_motion_threshold: 40
+  enabled: true              # 启发式屎/尿分类(非医疗级,阈值需按真实数据调)
+  min_duration_sec: 8        # 短于此一律 unknown(只是闻一闻/路过,不是排泄)
+  pee_max_duration_sec: 90   # 短于此 + 后段刨砂少 → 尿
+  poop_min_duration_sec: 120 # 长于此 + 后段刨砂多 → 屎
+  dig_motion_threshold: 40   # 后段帧差均值高于此算"刨砂"

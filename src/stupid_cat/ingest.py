@@ -6,7 +6,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -131,8 +131,15 @@ def rate_limited(
     active_fps: float,
     idle_fps: float,
     motion_threshold: float,
+    is_active: "Callable[[], bool] | None" = None,
 ) -> Generator[FrameEvent, None, None]:
-    """Yield frames with motion-aware fps throttling."""
+    """Yield frames with motion-aware fps throttling.
+
+    ``is_active`` (optional) is polled per frame: while it returns True (a visit
+    is in progress) frames are emitted at ``active_fps`` regardless of motion, so
+    the recording stays complete and plays at real time even when the cat sits
+    still (which would otherwise throttle to ``idle_fps``).
+    """
     prev_gray: np.ndarray | None = None
     last_emit = 0.0
     active = False
@@ -149,6 +156,8 @@ def rate_limited(
         else:
             active = motion_score(prev_gray, gray) >= motion_threshold
         prev_gray = gray
+        if is_active is not None and is_active():
+            active = True  # full fps during a visit, even for a still cat
         target_fps = active_fps if active else idle_fps
         interval = 1.0 / max(target_fps, 0.1)
 
@@ -179,6 +188,7 @@ class MultiCameraIngest:
         motion_threshold: float,
         queue_maxsize: int = 8,
         poll_timeout: float = 0.5,
+        is_active: "Callable[[], bool] | None" = None,
     ) -> None:
         if not sources:
             raise ValueError("sources must not be empty")
@@ -187,6 +197,7 @@ class MultiCameraIngest:
         self._idle_fps = idle_fps
         self._motion_threshold = motion_threshold
         self._poll_timeout = poll_timeout
+        self._is_active = is_active
         self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -221,6 +232,7 @@ class MultiCameraIngest:
                 active_fps=self._active_fps,
                 idle_fps=self._idle_fps,
                 motion_threshold=self._motion_threshold,
+                is_active=self._is_active,
             ):
                 if self._stop.is_set():
                     break
