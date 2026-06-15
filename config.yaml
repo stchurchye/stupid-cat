@@ -70,6 +70,7 @@ mqtt:
 
 waste:
   enabled: true              # 启发式屎/尿分类(非医疗级,阈值需按真实数据调)
+  min_duration_sec: 8        # 短于此一律 unknown(只是闻一闻/路过,不是排泄)
   pee_max_duration_sec: 90   # 短于此 + 后段刨砂少 → 尿
   poop_min_duration_sec: 120 # 长于此 + 后段刨砂多 → 屎
   dig_motion_threshold: 40   # 后段帧差均值高于此算"刨砂"

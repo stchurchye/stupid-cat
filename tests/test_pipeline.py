@@ -245,6 +245,93 @@ def test_correct_visit_appends_dual_camera_refs(fast_pipeline: Pipeline, tmp_pat
     assert (refs_dir / f"{visit_id}_cam2.jpg").exists()
 
 
+def test_last_qualified_iso_seeded_at_visit_start(fast_pipeline: Pipeline) -> None:
+    # Seeded at start so a visit that loses the cat right after entry still
+    # reports presence-based duration, not the exit-timeout moment.
+    t = 0.0
+    for _ in range(4):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    assert fast_pipeline.fsm.state == "active"
+    assert fast_pipeline._last_qualified_iso is not None
+
+
+def test_multi_cat_debounced_against_single_frame_split(fast_pipeline: Pipeline) -> None:
+    class _SplitOnceDetector:
+        in_roi = True
+        calls = 0
+
+        def detect(self, frame, camera_id):
+            if not self.in_roi:
+                return []
+            self.calls += 1
+            if self.calls <= 2:  # a transient 2nd box (YOLO split), not sustained
+                return [(150.0, 150.0, 250.0, 250.0), (300.0, 150.0, 400.0, 250.0)]
+            return [(150.0, 150.0, 250.0, 250.0)]
+
+    fast_pipeline.detector = _SplitOnceDetector()
+    t = 0.0
+    for _ in range(12):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    fast_pipeline.detector.in_roi = False
+    for _ in range(10):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+
+    visit = fast_pipeline.db.list_visits(only_ended=True)[0]
+    assert visit["max_cats"] == 1  # not flagged from a one/two-frame split
+    assert visit["multi_cat"] is False
+
+
+def test_digging_samples_only_while_cat_present(fast_pipeline: Pipeline) -> None:
+    t = 0.0
+    for _ in range(8):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    n = len(fast_pipeline._motion_samples)
+    assert n >= 1
+    fast_pipeline.detector.in_roi = False
+    for _ in range(5):  # no-cat tail (visit still active briefly)
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    # The empty post-departure tail must NOT add digging samples (else it would
+    # dilute the late-phase mean toward 'pee').
+    assert len(fast_pipeline._motion_samples) == n
+
+
+def test_correct_visit_keeps_old_ref_on_write_failure(fast_pipeline: Pipeline, tmp_path: Path, monkeypatch) -> None:
+    import stupid_cat.pipeline as pmod
+
+    vid = "v-writefail"
+    fast_pipeline._save_correction_crops(vid, {"cam1": np.zeros((100, 100, 3), dtype=np.uint8)})
+    fast_pipeline.db.create_visit(visit_id=vid, cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    fast_pipeline.db.end_visit(vid, cat_id="unknown", ended_at="2026-06-02T10:01:00+08:00",
+                               duration_sec=60, confidence=0.0)
+    fast_pipeline.correct_visit(vid, "mimi")
+    mimi_ref = tmp_path / "data" / "cats" / "mimi" / "refs" / f"{vid}_cam1.jpg"
+    assert mimi_ref.exists()
+
+    # Re-correct to cat2 but the ref write fails: the old ref must survive.
+    monkeypatch.setattr(pmod.cv2, "imwrite", lambda *a, **k: False)
+    fast_pipeline.correct_visit(vid, "cat2")
+    assert mimi_ref.exists()
+    assert not (tmp_path / "data" / "cats" / "cat2" / "refs" / f"{vid}_cam1.jpg").exists()
+
+
+def test_correct_visit_unknown_roundtrip_preserves_crop(fast_pipeline: Pipeline, tmp_path: Path) -> None:
+    vid = "v-roundtrip"
+    fast_pipeline._save_correction_crops(vid, {"cam1": np.zeros((100, 100, 3), dtype=np.uint8)})
+    fast_pipeline.db.create_visit(visit_id=vid, cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    fast_pipeline.db.end_visit(vid, cat_id="unknown", ended_at="2026-06-02T10:01:00+08:00",
+                               duration_sec=60, confidence=0.0)
+    fast_pipeline.correct_visit(vid, "mimi")
+    fast_pipeline.correct_visit(vid, "unknown")  # must re-persist the crop
+    fast_pipeline.correct_visit(vid, "cat2")     # must still be able to learn
+    assert (tmp_path / "data" / "cats" / "cat2" / "refs" / f"{vid}_cam1.jpg").exists()
+    assert not (tmp_path / "data" / "cats" / "mimi" / "refs" / f"{vid}_cam1.jpg").exists()
+
+
 def test_classify_waste_heuristic(fast_pipeline: Pipeline) -> None:
     w = fast_pipeline.cfg.waste
     w.enabled = True

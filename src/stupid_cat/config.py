@@ -115,6 +115,7 @@ class MqttConfig:
 @dataclass
 class WasteConfig:
     enabled: bool = False
+    min_duration_sec: int = 8  # shorter visits are 'unknown' (a sniff, not elimination)
     pee_max_duration_sec: int = 90
     poop_min_duration_sec: int = 120
     dig_motion_threshold: int = 40
