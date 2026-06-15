@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -47,7 +47,7 @@ class CatDetector:
 
     def __init__(self, cfg: InferenceConfig) -> None:
         self.cfg = cfg
-        self._model = None
+        self._model: Any = None  # ultralytics YOLO (untyped)
         self._tracker = ConfirmTracker(cfg.yolo_confirm_frames)
         # FP16 only on CUDA — half precision is unsupported/slow on CPU.
         self._use_half = bool(getattr(cfg, "fp16", False)) and str(cfg.device).startswith(

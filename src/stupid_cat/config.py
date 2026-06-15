@@ -194,7 +194,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _only_known_keys(section: str, data: dict[str, Any], cls: type[T]) -> dict[str, Any]:
-    allowed = {f.name for f in fields(cls)}
+    allowed = {f.name for f in fields(cls)}  # type: ignore[arg-type]  # cls is always a dataclass
     unknown = set(data) - allowed
     if unknown:
         raise ConfigError(f"unknown keys in {section}: {sorted(unknown)}")

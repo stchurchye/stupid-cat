@@ -98,7 +98,7 @@ def _open_video_writer(
     for codec in _BROWSER_CODECS:
         writer = cv2.VideoWriter(
             str(path),
-            cv2.VideoWriter_fourcc(*codec),
+            cv2.VideoWriter_fourcc(*codec),  # type: ignore[attr-defined]
             fps,
             (w, h),
         )

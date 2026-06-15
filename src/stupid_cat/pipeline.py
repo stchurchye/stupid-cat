@@ -704,7 +704,7 @@ class Pipeline:
             return False
 
         with self._lock:
-
+            assert primary is not None  # guaranteed by embed_work above
             crop = _crop_bgr(frame, primary)
             short_side = min(crop.shape[0], crop.shape[1])
             if short_side < self.cfg.inference.min_crop_px or self._embedding_buffer is None:
@@ -855,7 +855,8 @@ class Pipeline:
         self._best_correction_crops = {}
         self._best_correction_areas = {}
 
-        embs, weights = [], []
+        embs: list[np.ndarray] = []
+        weights: list[float] = []
         if self._embedding_buffer and len(self._embedding_buffer) > 0:
             embs, weights = self._embedding_buffer.embeddings_and_weights()
 
@@ -884,7 +885,7 @@ class Pipeline:
                 color_galleries=self.color_galleries,
                 color_weight=self.cfg.inference.color_weight,
             )
-            frames_used = len(self._embedding_buffer)
+            frames_used = len(self._embedding_buffer) if self._embedding_buffer is not None else 0
         else:
             cat_id, confidence = "unknown", 0.0
             frames_used = 0

@@ -413,7 +413,7 @@ class Database:
         cat_names = {c["id"]: c["name"] for c in self.list_cats()}
 
         by_cat_map: dict[str, dict[str, Any]] = {}
-        by_day_map: dict[str, dict[str, int]] = {}
+        by_day_map: dict[str, dict[str, Any]] = {}
         total_duration = 0
 
         for visit in visits:
