@@ -16,7 +16,14 @@ from stupid_cat.config import AppConfig, load_config
 from stupid_cat.db import Database
 from stupid_cat.detector import CatDetector, select_primary_bbox
 from stupid_cat.geometry import bbox_roi_overlap_ratio
-from stupid_cat.ingest import FrameEvent, FrameSource, MultiCameraIngest, VideoFileSource
+from stupid_cat.ingest import (
+    FrameEvent,
+    FrameSource,
+    MultiCameraIngest,
+    VideoFileSource,
+    _motion_gray,
+    motion_score,
+)
 from stupid_cat.preprocess import preprocess_frame
 from stupid_cat.recorder import VisitRecorder, reencode_for_browser, visit_recording_filename
 from stupid_cat.reid import (
@@ -55,6 +62,23 @@ def _crop_bgr(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> np.
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     return frame[y1:y2, x1:x2].copy()
+
+
+def _roi_region(frame: np.ndarray, roi: list) -> np.ndarray:
+    """Frame cropped to the ROI's bounding rect (for litter-localized motion)."""
+    h, w = frame.shape[:2]
+    xs = [p[0] for p in roi]
+    ys = [p[1] for p in roi]
+    x1, y1 = max(0, int(min(xs))), max(0, int(min(ys)))
+    x2, y2 = min(w, int(max(xs))), min(h, int(max(ys)))
+    if x2 <= x1 or y2 <= y1:
+        return frame[0:0, 0:0]
+    return frame[y1:y2, x1:x2]
+
+
+# How many frames must show >=2 cats in-ROI before a visit is flagged multi-cat
+# (debounce against a single-frame YOLO box split).
+_MULTI_CAT_MIN_FRAMES = 3
 
 
 class Pipeline:
@@ -127,9 +151,24 @@ class Pipeline:
         self._preview_frames: dict[str, np.ndarray] = {}
         self._preview_boxes: dict[str, list[tuple[float, float, float, float]]] = {}
         self._preview_qualified: dict[str, bool] = {}
+        self._preview_ts: dict[str, float] = {}
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
         self._consecutive_frame_errors = 0
+        # Set while a visit is active so ingest records at full fps (not throttled
+        # to idle by a still cat). Wall-clock time of the last qualified detection,
+        # used as the visit's true end so a larger exit_no_cat_sec doesn't inflate
+        # the reported duration.
+        self._visit_active = threading.Event()
+        self._last_qualified_iso: str | None = None
+        # Multi-cat detection (debounced): peak in-ROI count + frames with >=2.
+        self._peak_in_roi = 0
+        self._multi_cat_frames = 0
+        # Per-visit digging signal (primary camera, ROI region): (ts, motion)
+        # samples, used to classify pee vs poop by late-phase frame-diff (spec §12).
+        self._motion_samples: list[tuple[float, float]] = []
+        self._digging_prev_gray: np.ndarray | None = None
+        self._late_fraction = 0.4  # fraction of the visit treated as "late phase"
 
         self.fsm.on_visit_start = self._on_visit_start
         self.fsm.on_visit_end = self._on_visit_end
@@ -145,13 +184,18 @@ class Pipeline:
             return
         clips_to_reencode: list[Path] = []
         for visit_id in ids:
-            clip = self.recordings_dir / f"{visit_id}.mp4"
-            if clip.exists():
-                try:
-                    self.db.set_recording_path(visit_id, str(clip))
-                except Exception:  # noqa: BLE001
-                    logger.exception("could not relink recording for %s", visit_id)
-                clips_to_reencode.append(clip)
+            # Match the primary '{id}.mp4' AND per-camera '{id}_{cam}.mp4' clips
+            # so a crash-interrupted dual-cam visit relinks/re-encodes every clip.
+            clips = sorted(self.recordings_dir.glob(f"{visit_id}*.mp4"))
+            if not clips:
+                continue
+            primary_clip = self.recordings_dir / f"{visit_id}.mp4"
+            link = primary_clip if primary_clip.exists() else clips[0]
+            try:
+                self.db.set_recording_path(visit_id, str(link))
+            except Exception:  # noqa: BLE001
+                logger.exception("could not relink recording for %s", visit_id)
+            clips_to_reencode.extend(clips)
         # Re-encode recovered clips off the startup-critical path so ingest can
         # begin immediately instead of blocking on serial ffmpeg transcodes.
         if clips_to_reencode:
@@ -264,18 +308,29 @@ class Pipeline:
     def camera_ids(self) -> list[str]:
         return [c.id for c in self.cfg.cameras]
 
-    def get_preview_jpeg(self, camera_id: str, *, quality: int = 82) -> bytes | None:
+    def get_preview_jpeg(
+        self, camera_id: str, *, quality: int = 82, max_age_sec: float = 10.0
+    ) -> bytes | None:
         with self._preview_lock:
             frame = self._preview_frames.get(camera_id)
             boxes = list(self._preview_boxes.get(camera_id, []))
             qualified = self._preview_qualified.get(camera_id, False)
             roi = list(self.roi_by_camera.get(camera_id, []))
+            ts = self._preview_ts.get(camera_id)
 
-        if frame is None:
+        # Treat a stale frame as "no frame" so the live UI shows a frozen/dead
+        # camera as waiting rather than a still image labelled connected.
+        if frame is None or ts is None or (_mono_now() - ts) > max_age_sec:
             return None
 
         annotated = frame.copy()
         if len(roi) >= 3:
+            # Scale the calibration-resolution ROI to the actual decoded frame so
+            # the drawn box matches where qualification happens (spec §7.3).
+            fh, fw = annotated.shape[:2]
+            sw, sh = self._stream_dims.get(camera_id, (fw, fh))
+            if sw > 0 and sh > 0 and (sw != fw or sh != fh):
+                roi = [[p[0] * fw / sw, p[1] * fh / sh] for p in roi]
             pts = np.array(roi, dtype=np.int32)
             cv2.polylines(annotated, [pts], True, (0, 255, 0), 2)
         for bbox in boxes:
@@ -330,6 +385,7 @@ class Pipeline:
             active_fps=float(self.cfg.inference.active_fps),
             idle_fps=float(self.cfg.inference.idle_fps),
             motion_threshold=float(self.cfg.inference.motion_threshold),
+            is_active=self._visit_active.is_set,
         )
         self._ingest = ingest
         self._ingest_active = True
@@ -462,33 +518,61 @@ class Pipeline:
         boxes = self.detector.detect(frame, camera_id)
         primary = select_primary_bbox(boxes)
         qualified = False
+        in_roi_count = 0  # how many cats are simultaneously inside the ROI
         if primary is not None:
             h, w = frame.shape[:2]
             roi = self._roi_for_frame(camera_id, w, h)
-            overlap = bbox_roi_overlap_ratio(primary, roi)
-            qualified = overlap >= self.cfg.session.roi_overlap_min
+            thr = self.cfg.session.roi_overlap_min
+            qualified = bbox_roi_overlap_ratio(primary, roi) >= thr  # largest box (spec §8.4)
+            in_roi_count = sum(1 for b in boxes if bbox_roi_overlap_ratio(b, roi) >= thr)
 
         with self._lock:
-            self._last_frame_at[camera_id] = _iso_now()
+            now_iso = _iso_now()
+            self._last_frame_at[camera_id] = now_iso
+            if qualified:
+                self._last_qualified_iso = now_iso  # true presence end (any camera)
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
             visit_active = self.fsm.state == "active"
             visit_id = self.fsm.visit_id
+            # Multi-cat: track peak in-ROI count + how many frames showed >=2, so a
+            # single YOLO box-split doesn't mislabel a single cat (debounce at end).
+            if visit_active:
+                self._peak_in_roi = max(self._peak_in_roi, in_roi_count)
+                if in_roi_count >= 2:
+                    self._multi_cat_frames += 1
+            # Digging signal for pee/poop (spec §12): frame-diff motion WITHIN the
+            # litter ROI, sampled only while the cat is present (qualified) so the
+            # empty post-departure tail can't dilute the late-phase digging mean.
+            if visit_active and qualified and camera_id == self.cfg.recorder.primary_camera and roi:
+                region = _roi_region(frame, roi)
+                if region.size:
+                    gray = _motion_gray(region)
+                    if self._digging_prev_gray is not None and self._digging_prev_gray.shape == gray.shape:
+                        self._motion_samples.append((event.timestamp, motion_score(self._digging_prev_gray, gray)))
+                        if len(self._motion_samples) > 6000:
+                            self._motion_samples = self._motion_samples[-4000:]
+                    self._digging_prev_gray = gray
             embed_work = visit_active and primary is not None
 
         with self._preview_lock:
             self._preview_frames[camera_id] = frame.copy()
             self._preview_boxes[camera_id] = boxes
             self._preview_qualified[camera_id] = qualified
+            self._preview_ts[camera_id] = _mono_now()
 
         if visit_active:
             with self._lock:
-                self._camera_ids_seen.add(camera_id)
-                if (
-                    self._record_this_visit
-                    and camera_id in self.record_camera_ids()
-                    and visit_id
-                ):
-                    self._write_visit_recording(camera_id, visit_id, frame)
+                # Re-read LIVE fsm state under the lock: pause()/visit-end may have
+                # run since the first lock block was released. Writing to a cleared
+                # recorder would recreate (and truncate) the just-finalized clip.
+                if self.fsm.state == "active" and self.fsm.visit_id == visit_id:
+                    self._camera_ids_seen.add(camera_id)
+                    if (
+                        self._record_this_visit
+                        and camera_id in self.record_camera_ids()
+                        and visit_id
+                    ):
+                        self._write_visit_recording(camera_id, visit_id, frame)
 
         if not embed_work:
             return False
@@ -544,6 +628,14 @@ class Pipeline:
         self._visit_started_at = _iso_now()
         self._best_correction_crops = {}
         self._best_correction_areas = {}
+        # Seed to the start time (NOT None): if the cat is only seen on the start
+        # frame, duration still reflects presence instead of the exit timeout.
+        self._last_qualified_iso = self._visit_started_at
+        self._peak_in_roi = 0
+        self._multi_cat_frames = 0
+        self._motion_samples = []
+        self._digging_prev_gray = None
+        self._visit_active.set()  # ingest now records at full fps until visit end
         # Decide once per visit whether to record (config + disk space).
         self._record_this_visit = self.cfg.recorder.enabled and self._disk_ok()
         # Persist the visit at START so a crash mid-visit leaves a recoverable
@@ -559,6 +651,33 @@ class Pipeline:
             logger.exception("failed to persist visit start %s", visit_id)
         logger.info("visit started %s", visit_id)
 
+    def _late_digging_motion(self) -> float:
+        """Mean frame-difference motion over the late phase of the visit — a proxy
+        for litter digging (covering) that tends to follow a poop."""
+        samples = self._motion_samples
+        if len(samples) < 2:
+            return 0.0
+        t0, t1 = samples[0][0], samples[-1][0]
+        span = t1 - t0
+        if span <= 0:
+            return float(np.mean([m for _, m in samples]))
+        cutoff = t0 + span * (1.0 - self._late_fraction)
+        late = [m for ts, m in samples if ts >= cutoff]
+        return float(np.mean(late)) if late else float(samples[-1][1])
+
+    def _classify_waste(self, duration_sec: int, late_motion: float) -> tuple[str, float]:
+        """Heuristic pee/poop/unknown from duration + late digging (spec §12).
+        Non-medical; thresholds are configurable and meant for field tuning."""
+        w = self.cfg.waste
+        if duration_sec < w.min_duration_sec:
+            return "unknown", 0.0  # too brief to tell (a sniff / walk-through)
+        high_dig = late_motion >= w.dig_motion_threshold
+        if duration_sec >= w.poop_min_duration_sec and high_dig:
+            return "poop", 0.7
+        if duration_sec <= w.pee_max_duration_sec and not high_dig:
+            return "pee", 0.6
+        return "unknown", 0.0
+
     def _on_visit_end(
         self,
         visit_id: str,
@@ -567,11 +686,16 @@ class Pipeline:
         duration: float,
         discard: bool,
     ) -> None:
+        self._visit_active.clear()  # back to motion-gated idle fps
         # Skip the (background) browser re-encode when we're about to discard the
         # clip, so it can't race the unlink below.
         recording_paths = self._stop_visit_recorders(reencode=not discard)
         self.recorder.stop(reencode=not discard)
         recording_path = recording_paths.get(self.cfg.recorder.primary_camera)
+        if recording_path is None and recording_paths:
+            # Primary never qualified but a secondary cam recorded — still store a
+            # clip path so the DB row / crash-recovery has something to point at.
+            recording_path = next(iter(recording_paths.values()))
         self._recording_path = None
 
         if discard:
@@ -591,7 +715,16 @@ class Pipeline:
             return
 
         if self._best_correction_crops:
-            self._save_correction_crops(visit_id, self._best_correction_crops)
+            # Save only the single best (largest) crop for the visit: one
+            # appearance = one ref, so a dual-camera visit isn't double-counted in
+            # the unweighted centroid (and one correction can't satisfy min_refs).
+            best_cam = max(
+                self._best_correction_crops,
+                key=lambda cam: self._best_correction_areas.get(cam, -1.0),
+            )
+            self._save_correction_crops(
+                visit_id, {best_cam: self._best_correction_crops[best_cam]}
+            )
         self._best_correction_crops = {}
         self._best_correction_areas = {}
 
@@ -617,9 +750,30 @@ class Pipeline:
             frames_used = 0
 
         started_at = self._visit_started_at or _iso_now()
-        ended_at = _iso_now()
+        # End the visit at the LAST time a cat was actually seen (any camera), not
+        # the no-cat-timeout moment, so widening exit_no_cat_sec to avoid splitting
+        # a turning cat doesn't inflate the reported duration.
+        ended_at = self._last_qualified_iso or _iso_now()
         duration_sec = _duration_seconds_wall(started_at, ended_at)
         camera_ids = sorted(self._camera_ids_seen)
+        # Only treat as multi-cat if >=2 cats were in-ROI for enough frames
+        # (debounce); a one-frame YOLO split shouldn't downgrade a single cat.
+        sustained_multi = self._multi_cat_frames >= _MULTI_CAT_MIN_FRAMES
+        max_cats = max(1, self._peak_in_roi) if sustained_multi else 1
+        if max_cats >= 2 and cat_id != "unknown":
+            # Two cats shared the box: the fused embedding mixes them, so don't
+            # claim an identity — record unknown (the max_cats/multi_cat flag and
+            # the saved crop still let the user correct it manually).
+            logger.info("visit %s is multi-cat (%d); forcing cat_id=unknown", visit_id, max_cats)
+            cat_id, confidence = "unknown", 0.0
+
+        # Pee/poop heuristic — only for a single-cat visit (a mixed visit's
+        # duration/digging belong to two cats).
+        waste_type, waste_confidence = "unknown", 0.0
+        if self.cfg.waste.enabled and max_cats < 2:
+            waste_type, waste_confidence = self._classify_waste(
+                duration_sec, self._late_digging_motion()
+            )
 
         def _finalize() -> None:
             self.db.end_visit(
@@ -631,6 +785,9 @@ class Pipeline:
                 frames_used=frames_used,
                 camera_ids=camera_ids,
                 recording_path=str(recording_path) if recording_path else None,
+                max_cats=max_cats,
+                waste_type=waste_type,
+                waste_confidence=waste_confidence,
             )
 
         # The row was created at visit start; if it is somehow missing (start
@@ -648,7 +805,14 @@ class Pipeline:
 
         self._visit_started_at = None
         self._embedding_buffer = None
-        logger.info("visit ended %s cat=%s conf=%.2f", visit_id, cat_id, confidence)
+        logger.info(
+            "visit ended %s cat=%s conf=%.2f max_cats=%d", visit_id, cat_id, confidence, max_cats
+        )
+        if max_cats >= 2:
+            logger.warning(
+                "visit %s saw %d cats in the box at once — identity is unreliable",
+                visit_id, max_cats,
+            )
 
     def _set_centroid(self, cat_id: str, centroid: np.ndarray) -> None:
         """Replace the centroids dict atomically (copy-on-write).
@@ -659,65 +823,133 @@ class Pipeline:
         """
         self.centroids = {**self.centroids, cat_id: centroid}
 
+    def _collect_visit_ref_crops(self, visit_id: str) -> dict[str, np.ndarray]:
+        """Read this visit's already-saved refs (from a prior correction) so a
+        re-correction can re-apply them to a different cat."""
+        crops: dict[str, np.ndarray] = {}
+        cats_dir = self._data_dir / "cats"
+        if not cats_dir.is_dir():
+            return crops
+        prefix = f"{visit_id}_"
+        for cat_dir in sorted(cats_dir.iterdir()):
+            refs = cat_dir / "refs"
+            if not refs.is_dir():
+                continue
+            for path in sorted(refs.glob(f"{visit_id}_*.jpg")):
+                cam = path.name[len(prefix):].removesuffix(".jpg")
+                if cam and cam not in crops:
+                    img = cv2.imread(str(path))
+                    if img is not None:
+                        crops[cam] = img
+            legacy = refs / f"{visit_id}.jpg"
+            if legacy.exists() and self.cfg.recorder.primary_camera not in crops:
+                img = cv2.imread(str(legacy))
+                if img is not None:
+                    crops[self.cfg.recorder.primary_camera] = img
+        return crops
+
+    def _delete_visit_refs(self, visit_id: str, *, except_cat: str | None = None) -> set[str]:
+        """Delete this visit's refs from every cat except ``except_cat``.
+
+        Returns the ids of cats whose refs changed (so their centroids rebuild)."""
+        affected: set[str] = set()
+        cats_dir = self._data_dir / "cats"
+        if not cats_dir.is_dir():
+            return affected
+        for cat_dir in cats_dir.iterdir():
+            if not cat_dir.is_dir() or cat_dir.name == except_cat:
+                continue
+            refs = cat_dir / "refs"
+            if not refs.is_dir():
+                continue
+            removed = False
+            paths = list(refs.glob(f"{visit_id}_*.jpg")) + [refs / f"{visit_id}.jpg"]
+            for path in paths:
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                    removed = True
+            if removed:
+                affected.add(cat_dir.name)
+        return affected
+
+    def _rebuild_centroid_for(self, cat_id: str) -> None:
+        """Rebuild (or remove) one cat's centroid from its current refs. Heavy
+        build runs off the pipeline lock; only the swap/remove is locked."""
+        cat_dir = self._data_dir / "cats" / cat_id
+        refs_dir = cat_dir / "refs"
+        centroid = None
+        if refs_dir.is_dir():
+            centroid = build_centroid_from_refs(
+                self.embedder, refs_dir, self.cfg.preprocess, self.cfg.cats.min_refs
+            )
+        centroid_path = cat_dir / "centroid.npy"
+        if centroid is None:
+            centroid_path.unlink(missing_ok=True)
+            with self._lock:
+                if cat_id in self.centroids:
+                    self.centroids = {k: v for k, v in self.centroids.items() if k != cat_id}
+        else:
+            np.save(centroid_path, centroid)
+            with self._lock:
+                self._set_centroid(cat_id, centroid)
+
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
-        """DB correction plus optional ref append and centroid rebuild (spec §9.3).
+        """DB correction plus ref move and centroid rebuild (spec §9.3).
 
-        One correction applies to the whole visit: every per-camera crop saved at
-        visit end is appended to refs/ and the cat centroid is rebuilt once.
-
-        The expensive centroid rebuild (a Re-ID forward pass per ref image) runs
-        WITHOUT the pipeline lock so an admin correction can't freeze frame
-        ingest / the FSM watchdog; only the cheap copy-on-write swap is locked.
-        The DB and Embedder each have their own internal locks.
+        A correction re-assigns the WHOLE visit: the visit's representative crop is
+        moved to the new cat's refs and removed from any cat it was previously
+        assigned to (re-correction must not leave stale refs biasing the old cat).
+        Both affected cats' centroids are rebuilt. Correcting to ``unknown`` just
+        removes the visit's learning. Heavy rebuilds run off the pipeline lock.
         """
         allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
         if new_cat_id not in allowed:
             raise ValueError(f"cat_id not registered: {new_cat_id}")
 
         self.db.correct_visit(visit_id, new_cat_id)
+
+        # Crop source: the freshly-captured crops (first correction) or, if those
+        # were already consumed, the refs saved under the previous cat.
+        crops = self._load_correction_crops(visit_id) or self._collect_visit_ref_crops(visit_id)
+
         if new_cat_id == "unknown":
-            self._delete_correction_crops(visit_id)
+            rebuild_cats = self._delete_visit_refs(visit_id, except_cat=None)
+            # Keep the crop recoverable (re-persist) so a later correction to a
+            # real cat can still learn from this visit.
+            if crops:
+                self._save_correction_crops(visit_id, crops)
+            for cat in rebuild_cats:
+                self._rebuild_centroid_for(cat)
             return
 
-        crops = self._load_correction_crops(visit_id)
         if not crops:
             logger.warning("no correction crops for visit %s; DB updated only", visit_id)
             return
 
-        cat_dir = self._data_dir / "cats" / new_cat_id
-        refs_dir = cat_dir / "refs"
+        # Write the new cat's ref FIRST; only purge the old cat's refs / source
+        # crops once a write has succeeded, so an imwrite failure (e.g. full disk)
+        # can't lose the visit's only learning crop.
+        refs_dir = self._data_dir / "cats" / new_cat_id / "refs"
         refs_dir.mkdir(parents=True, exist_ok=True)
-        refs_written = 0
+        written = False
         for camera_id, crop in crops.items():
             ref_path = refs_dir / f"{visit_id}_{camera_id}.jpg"
             if cv2.imwrite(str(ref_path), crop):
-                refs_written += 1
+                written = True
             else:
                 logger.warning("failed to write ref %s", ref_path)
-        if refs_written == 0:
-            return
-
-        self._delete_correction_crops(visit_id)
-
-        centroid = build_centroid_from_refs(
-            self.embedder,
-            refs_dir,
-            self.cfg.preprocess,
-            self.cfg.cats.min_refs,
-        )
-        if centroid is None:
-            logger.info(
-                "saved %d ref(s) for %s; centroid unchanged (need %d refs)",
-                refs_written,
-                new_cat_id,
-                self.cfg.cats.min_refs,
+        if not written:
+            logger.warning(
+                "could not write any ref for visit %s; leaving previous refs intact", visit_id
             )
             return
 
-        np.save(cat_dir / "centroid.npy", centroid)
-        with self._lock:
-            self._set_centroid(new_cat_id, centroid)
-        logger.info("rebuilt centroid for %s", new_cat_id)
+        rebuild_cats = self._delete_visit_refs(visit_id, except_cat=new_cat_id)
+        rebuild_cats.add(new_cat_id)
+        self._delete_correction_crops(visit_id)
+        for cat in rebuild_cats:
+            self._rebuild_centroid_for(cat)
+        logger.info("correction rebuilt centroids for %s", sorted(rebuild_cats))
 
     def rebuild_cat_centroid(self, cat_id: str) -> bool:
         """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding).

@@ -19,6 +19,10 @@ class CorrectVisitBody(BaseModel):
     cat_id: str
 
 
+class WasteBody(BaseModel):
+    waste_type: str
+
+
 def _visit_recordings(pipeline: Pipeline, visit: dict) -> list[dict[str, str]]:
     visit_id = visit["id"]
     primary = pipeline.cfg.recorder.primary_camera
@@ -80,8 +84,18 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         return db.list_cats()
 
     @app.get("/api/v1/visits")
-    def list_visits(from_ts: str | None = None, to_ts: str | None = None, cat_id: str | None = None) -> list:
-        visits = db.list_visits(from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True)
+    def list_visits(
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        cat_id: str | None = None,
+        limit: int = 1000,
+    ) -> list:
+        # Bound the result (and the per-visit recording-file stat()s) so the
+        # timeline stays responsive after months of 24/7 visits.
+        limit = max(1, min(limit, 5000))
+        visits = db.list_visits(
+            from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True, limit=limit
+        )
         return [_enrich_visit(pipeline, v) for v in visits]
 
     @app.get("/api/v1/stats")
@@ -112,6 +126,16 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "visit_id": visit_id, "cat_id": body.cat_id}
+
+    @app.post("/api/v1/visits/{visit_id}/waste")
+    def set_waste(visit_id: str, body: WasteBody) -> dict:
+        if body.waste_type not in ("pee", "poop", "unknown"):
+            raise HTTPException(status_code=400, detail="waste_type must be pee/poop/unknown")
+        try:
+            db.set_waste_type(visit_id, body.waste_type)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True, "visit_id": visit_id, "waste_type": body.waste_type}
 
     @app.post("/api/v1/cats/{cat_id}/rebuild-embedding")
     def rebuild_embedding(cat_id: str) -> dict:
@@ -148,8 +172,11 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         pipeline.resume()
         return {"paused": False}
 
-    if recordings_dir.exists():
-        app.mount("/recordings", StaticFiles(directory=recordings_dir), name="recordings")
+    # Create the dir up front so the mount always succeeds; otherwise on a fresh
+    # install it doesn't exist yet at startup and every /recordings/* URL 404s
+    # until the process is restarted after the first visit.
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/recordings", StaticFiles(directory=recordings_dir), name="recordings")
     if static_dir.exists():
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
