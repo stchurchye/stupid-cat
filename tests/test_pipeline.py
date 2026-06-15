@@ -171,6 +171,16 @@ def test_disk_guard_skips_recording_when_low(fast_pipeline: Pipeline, monkeypatc
     assert fast_pipeline._disk_ok() is True
 
 
+def test_roi_normalized_is_resolution_independent(fast_pipeline: Pipeline) -> None:
+    # 0..1 coords scale by the frame size and map to the same RELATIVE box at any
+    # resolution (the green box never shifts across main/substream).
+    fast_pipeline.roi_by_camera["cam1"] = [[0.1, 0.1], [0.5, 0.1], [0.5, 0.4], [0.1, 0.4]]
+    roi_a = fast_pipeline._roi_for_frame("cam1", 640, 480)
+    assert roi_a[0] == [64.0, 48.0] and roi_a[2] == [320.0, 192.0]
+    roi_b = fast_pipeline._roi_for_frame("cam1", 1280, 720)
+    assert roi_b[0] == [128.0, 72.0] and roi_b[2] == [640.0, 288.0]
+
+
 def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
     # Fixture calibrates the camera at 640x480.
     roi_full = fast_pipeline._roi_for_frame("cam1", 640, 480)

@@ -4,9 +4,11 @@
 #   fp16: true                # cuda 上开半精度省显存（CPU/MPS 会自动忽略）
 
 # cameras:
-#   # 提示：roi_polygon 按拉流分辨率（stream_width × stream_height）标注；
-#   # 若改用子码流（更低分辨率）拉流，把 stream_width/height 改成子码流分辨率，
-#   # ROI 会自动按实际帧尺寸缩放（spec §7.3）。
+#   # ROI 两种写法（自动识别）：
+#   #  1) 归一化(推荐)：用 0~1 比例,如 roi_polygon: [[0.16,0.17],[0.78,0.17],[0.78,0.83],[0.16,0.83]]
+#   #     —— 与分辨率无关,换主/子码流、换机器绿框都不漂移,stream_width/height 可不管。
+#   #  2) 像素：用整数像素坐标,需把 stream_width/height 设成"标注 ROI 时的分辨率"
+#   #     (= 实际拉流分辨率),否则绿框会被按比例缩放而错位。
 #   - id: cam1
 #     rtsp_url: "rtsp://user:pass@192.168.1.101:554/stream1"
 #     # enabled: false        # 临时停用某路（不影响另一路的退出判定）

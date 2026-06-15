@@ -76,6 +76,14 @@ def _roi_region(frame: np.ndarray, roi: list) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
+def _is_normalized_roi(roi: list) -> bool:
+    """True if every ROI coordinate is in 0..1 (i.e. fractions of the frame)."""
+    try:
+        return bool(roi) and all(0.0 <= float(c) <= 1.0 for p in roi for c in p)
+    except (TypeError, ValueError):
+        return False
+
+
 # How many frames must show >=2 cats in-ROI before a visit is flagged multi-cat
 # (debounce against a single-frame YOLO box split).
 _MULTI_CAT_MIN_FRAMES = 3
@@ -121,10 +129,6 @@ class Pipeline:
         self.camera_weights = {c.id: c.weight for c in self._cameras}
         self.roi_by_camera = {c.id: c.roi_polygon for c in self._cameras}
         self._stream_dims = {c.id: (c.stream_width, c.stream_height) for c in self._cameras}
-        # Cache of ROI polygons scaled to the actual decoded frame size, keyed by
-        # camera id -> (frame_w, frame_h, scaled_polygon). Lets a lower-res
-        # substream reuse a main-stream-calibrated ROI (spec §7.3).
-        self._roi_scaled: dict[str, tuple[int, int, list]] = {}
 
         self.fsm = VisitSessionFSM(
             camera_ids=[c.id for c in self._cameras],
@@ -315,7 +319,6 @@ class Pipeline:
             frame = self._preview_frames.get(camera_id)
             boxes = list(self._preview_boxes.get(camera_id, []))
             qualified = self._preview_qualified.get(camera_id, False)
-            roi = list(self.roi_by_camera.get(camera_id, []))
             ts = self._preview_ts.get(camera_id)
 
         # Treat a stale frame as "no frame" so the live UI shows a frozen/dead
@@ -324,13 +327,11 @@ class Pipeline:
             return None
 
         annotated = frame.copy()
+        # Draw the SAME frame-space ROI the detector qualifies against, so the box
+        # always matches reality (normalized or pixel, any resolution).
+        fh, fw = annotated.shape[:2]
+        roi = self._roi_for_frame(camera_id, fw, fh)
         if len(roi) >= 3:
-            # Scale the calibration-resolution ROI to the actual decoded frame so
-            # the drawn box matches where qualification happens (spec §7.3).
-            fh, fw = annotated.shape[:2]
-            sw, sh = self._stream_dims.get(camera_id, (fw, fh))
-            if sw > 0 and sh > 0 and (sw != fw or sh != fh):
-                roi = [[p[0] * fw / sw, p[1] * fh / sh] for p in roi]
             pts = np.array(roi, dtype=np.int32)
             cv2.polylines(annotated, [pts], True, (0, 255, 0), 2)
         for bbox in boxes:
@@ -487,26 +488,25 @@ class Pipeline:
             path.unlink(missing_ok=True)
 
     def _roi_for_frame(self, camera_id: str, frame_w: int, frame_h: int) -> list:
-        """ROI polygon scaled from its calibration resolution to the actual frame.
+        """ROI polygon in the ACTUAL decoded-frame pixel space.
 
-        ROIs are authored in the camera's ``stream_width``×``stream_height``; if the
-        decoded frame differs (e.g. a lower-res substream), scale so the overlap
-        test stays in one coordinate space (spec §7.3).
+        Two authoring modes (auto-detected):
+        - Normalized (every coord in 0..1): resolution-independent — scaled by the
+          frame size, so the ROI never shifts across main/substream or machines.
+        - Pixel (calibration coords): scaled from stream_width/height to the frame
+          (spec §7.3), so a lower-res substream reuses a main-stream-marked ROI.
+        Cheap (a few points) so it is recomputed per call — no shared cache to race.
         """
         roi = self.roi_by_camera.get(camera_id, [])
         if not roi or frame_w <= 0 or frame_h <= 0:
             return roi
+        if _is_normalized_roi(roi):
+            return [[float(p[0]) * frame_w, float(p[1]) * frame_h] for p in roi]
         sw, sh = self._stream_dims.get(camera_id, (frame_w, frame_h))
         if sw <= 0 or sh <= 0 or (sw == frame_w and sh == frame_h):
             return roi
-        cached = self._roi_scaled.get(camera_id)
-        if cached is not None and cached[0] == frame_w and cached[1] == frame_h:
-            return cached[2]
-        sx = frame_w / sw
-        sy = frame_h / sh
-        scaled = [[float(p[0]) * sx, float(p[1]) * sy] for p in roi]
-        self._roi_scaled[camera_id] = (frame_w, frame_h, scaled)
-        return scaled
+        sx, sy = frame_w / sw, frame_h / sh
+        return [[float(p[0]) * sx, float(p[1]) * sy] for p in roi]
 
     def _process_frame(self, event: FrameEvent) -> bool:
         """Process one frame. Returns True only if it did Re-ID work (embedded a
