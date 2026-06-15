@@ -15,6 +15,7 @@ yolo11s.pt
 
 .tmp/
 .pip-cache/
+tools/ffmpeg/
 .cursor/
 .agents/
 
