@@ -126,6 +126,9 @@ class RecorderConfig:
     record_cameras: list[str] | None = None
     max_seconds: int = 30
     min_free_mb: int = 500  # skip recording a visit if free disk space is below this
+    # Auto-delete clips older than this many days (0 = keep forever). Combined with
+    # min_free_mb free-space rotation, this stops a 24/7 box silently filling up.
+    retention_days: int = 0
 
 
 @dataclass

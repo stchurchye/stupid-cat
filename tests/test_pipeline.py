@@ -670,3 +670,47 @@ def test_recording_continues_without_detection(fast_pipeline: Pipeline) -> None:
     rec = fast_pipeline._visit_recorders.get("cam1")
     assert rec is not None
     assert rec.frames_written >= 21
+
+
+def test_retention_removes_old_clips(fast_pipeline: Pipeline) -> None:
+    import os
+    import time as _t
+
+    rec = fast_pipeline.recordings_dir
+    rec.mkdir(parents=True, exist_ok=True)
+    old = rec / "old.mp4"
+    old.write_bytes(b"x")
+    os.utime(old, (_t.time() - 10 * 86400, _t.time() - 10 * 86400))
+    new = rec / "new.mp4"
+    new.write_bytes(b"x")
+    fast_pipeline.cfg.recorder.retention_days = 7
+    fast_pipeline.cfg.recorder.min_free_mb = 0  # isolate the age path
+    fast_pipeline._retention_pass()
+    assert not old.exists()
+    assert new.exists()
+
+
+def test_retention_free_space_rotation_deletes_oldest(fast_pipeline: Pipeline, monkeypatch) -> None:
+    import os
+    import time as _t
+    import types
+
+    import stupid_cat.pipeline as pmod
+
+    rec = fast_pipeline.recordings_dir
+    rec.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for i, name in enumerate(["a.mp4", "b.mp4", "c.mp4"]):
+        p = rec / name
+        p.write_bytes(b"x" * 100)
+        os.utime(p, (_t.time() - i * 100, _t.time() - i * 100))  # c is oldest
+        files[name] = p
+    fast_pipeline.cfg.recorder.retention_days = 0  # only exercise free-space path
+    fast_pipeline.cfg.recorder.min_free_mb = 1  # threshold = 1 MiB
+    # 100 bytes below threshold: deleting one 100-byte clip crosses it.
+    monkeypatch.setattr(
+        pmod.shutil, "disk_usage", lambda _p: types.SimpleNamespace(free=1024 * 1024 - 100)
+    )
+    fast_pipeline._retention_pass()
+    assert not files["c.mp4"].exists()  # oldest removed
+    assert files["a.mp4"].exists() and files["b.mp4"].exists()
