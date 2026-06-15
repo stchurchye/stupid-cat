@@ -41,6 +41,12 @@ class InferenceConfig:
     fusion: str = "weighted_median"
     fusion_max_frames: int = 64
     fp16: bool = False  # half precision; only applied on CUDA devices
+    # COCO class ids accepted as "the cat". A hunched/back-to-camera cat in the
+    # litter box is often misclassified by YOLO (e.g. as sheep/dog/bear), and the
+    # box only ever contains a cat, so accept the commonly-confused animal classes
+    # to avoid losing the cat (which would split one visit into several).
+    # 15 cat, 16 dog, 17 horse, 18 sheep, 19 cow, 21 bear, 77 teddy bear.
+    detect_class_ids: list[int] = field(default_factory=lambda: [15, 16, 17, 18, 19, 21, 77])
 
 
 @dataclass
