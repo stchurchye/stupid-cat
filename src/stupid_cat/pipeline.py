@@ -172,9 +172,10 @@ class Pipeline:
         # the reported duration.
         self._visit_active = threading.Event()
         self._last_qualified_iso: str | None = None
-        # Multi-cat detection (debounced): peak in-ROI count + frames with >=2.
+        # Multi-cat detection (debounced): peak in-ROI count, recorded only while a
+        # >=2-cat streak is sustained; _multi_cat_streak is the current run length.
         self._peak_in_roi = 0
-        self._multi_cat_frames = 0
+        self._multi_cat_streak = 0
         # Per-visit digging signal (primary camera, ROI region): (ts, motion)
         # samples, used to classify pee vs poop by late-phase frame-diff (spec §12).
         self._motion_samples: list[tuple[float, float]] = []
@@ -541,12 +542,18 @@ class Pipeline:
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
             visit_active = self.fsm.state == "active"
             visit_id = self.fsm.visit_id
-            # Multi-cat: track peak in-ROI count + how many frames showed >=2, so a
-            # single YOLO box-split doesn't mislabel a single cat (debounce at end).
+            # Multi-cat: only trust the peak count once >=2 cats have been in-ROI
+            # for _MULTI_CAT_MIN_FRAMES CONSECUTIVE frames. Tying the peak to a
+            # sustained streak (rather than tracking peak and a separate frame
+            # tally independently) stops a single YOLO box-split frame from
+            # inflating the peak and mislabelling a lone cat as multi-cat.
             if visit_active:
-                self._peak_in_roi = max(self._peak_in_roi, in_roi_count)
                 if in_roi_count >= 2:
-                    self._multi_cat_frames += 1
+                    self._multi_cat_streak += 1
+                    if self._multi_cat_streak >= _MULTI_CAT_MIN_FRAMES:
+                        self._peak_in_roi = max(self._peak_in_roi, in_roi_count)
+                else:
+                    self._multi_cat_streak = 0
             # Digging signal for pee/poop (spec §12): frame-diff motion WITHIN the
             # litter ROI, sampled only while the cat is present (qualified) so the
             # empty post-departure tail can't dilute the late-phase digging mean.
@@ -639,7 +646,7 @@ class Pipeline:
         # frame, duration still reflects presence instead of the exit timeout.
         self._last_qualified_iso = self._visit_started_at
         self._peak_in_roi = 0
-        self._multi_cat_frames = 0
+        self._multi_cat_streak = 0
         self._motion_samples = []
         self._digging_prev_gray = None
         self._visit_active.set()  # ingest now records at full fps until visit end
@@ -776,10 +783,10 @@ class Pipeline:
         ended_at = self._last_qualified_iso or _iso_now()
         duration_sec = _duration_seconds_wall(started_at, ended_at)
         camera_ids = sorted(self._camera_ids_seen)
-        # Only treat as multi-cat if >=2 cats were in-ROI for enough frames
-        # (debounce); a one-frame YOLO split shouldn't downgrade a single cat.
-        sustained_multi = self._multi_cat_frames >= _MULTI_CAT_MIN_FRAMES
-        max_cats = max(1, self._peak_in_roi) if sustained_multi else 1
+        # _peak_in_roi is only recorded after a sustained (>=_MULTI_CAT_MIN_FRAMES
+        # consecutive) >=2-cat streak, so a non-zero peak already means real
+        # multi-cat; a one-frame YOLO split never reaches it.
+        max_cats = max(1, self._peak_in_roi)
         if max_cats >= 2 and cat_id != "unknown":
             # Two cats shared the box: the fused embedding mixes them, so don't
             # claim an identity — record unknown (the max_cats/multi_cat flag and

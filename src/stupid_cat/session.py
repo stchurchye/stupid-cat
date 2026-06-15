@@ -32,6 +32,10 @@ class VisitSessionFSM:
         self.cooldown_until: float | None = None
         self.visit_id: str | None = None
         self.started_at: float | None = None
+        # First qualified timestamp of the current build-up/visit — the cat's true
+        # arrival, used to measure presence for the discard decision (started_at is
+        # the later entry-completion moment, so it would undercount presence).
+        self._visit_first_qualified: float | None = None
         self._last_ts: float | None = None
         self._last_qualified_at: dict[str, float] = {cid: 0.0 for cid in self.camera_ids}
         self._last_frame_qualified: dict[str, bool] = {cid: False for cid in self.camera_ids}
@@ -56,10 +60,13 @@ class VisitSessionFSM:
             # camera that went silent while last seen as "qualified" keeps
             # `any_qualified` True and accumulates a phantom entry.
             self._last_frame_qualified = dict.fromkeys(self.camera_ids, False)
+            self._visit_first_qualified = None
 
         self._last_frame_qualified[camera_id] = qualified
         if qualified:
             self._last_qualified_at[camera_id] = timestamp
+            if self._visit_first_qualified is None:
+                self._visit_first_qualified = timestamp
 
         if self.state == "active":
             self._maybe_end_visit(timestamp)
@@ -73,6 +80,7 @@ class VisitSessionFSM:
             self.enter_accumulator += dt
         else:
             self.enter_accumulator = 0.0
+            self._visit_first_qualified = None  # presence lapsed; arrival restarts
 
         if self.enter_accumulator >= self.enter_overlap_sec:
             self._start_visit(timestamp)
@@ -98,6 +106,7 @@ class VisitSessionFSM:
         self.enter_accumulator = 0.0
         self.cooldown_until = None
         self._last_frame_qualified = dict.fromkeys(self.camera_ids, False)
+        self._visit_first_qualified = None
 
     def _start_visit(self, timestamp: float) -> None:
         self.state = "active"
@@ -119,7 +128,17 @@ class VisitSessionFSM:
         if self.visit_id is None or self.started_at is None:
             return
 
-        duration = max(0.0, timestamp - self.started_at)
+        # Discard on actual qualified-presence time (first cat seen -> last cat
+        # seen), NOT timestamp - started_at: that window includes exit_no_cat_sec,
+        # so a brief false trigger was inflated past min_visit_sec and never
+        # discarded. started_at is the entry-completion moment, so presence is
+        # measured from _visit_first_qualified (the true arrival) instead.
+        last_seen = max(self._last_qualified_at.values())
+        first_seen = self._visit_first_qualified
+        if first_seen is not None and last_seen > 0.0:
+            duration = max(0.0, last_seen - first_seen)
+        else:
+            duration = 0.0
         discard = duration < self.min_visit_sec
 
         # Always transition state even if the callback raises, or the FSM would
@@ -136,6 +155,7 @@ class VisitSessionFSM:
         finally:
             self.visit_id = None
             self.started_at = None
+            self._visit_first_qualified = None
             if enter_cooldown:
                 self.state = "cooldown"
                 self.cooldown_until = timestamp + self.cooldown_sec

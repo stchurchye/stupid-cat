@@ -73,6 +73,30 @@ def test_pause_ends_visit_without_cooldown() -> None:
     assert len(starts) == 1
 
 
+def test_brief_trigger_inside_long_exit_window_is_discarded() -> None:
+    # Regression: a short presence must be discarded even when a large
+    # exit_no_cat_sec inflates the raw active window far past min_visit_sec.
+    discarded: list[bool] = []
+    fsm = VisitSessionFSM(
+        camera_ids=["cam1"],
+        enter_overlap_sec=0.05,
+        exit_no_cat_sec=10.0,
+        cooldown_sec=0.05,
+        min_visit_sec=2.0,
+    )
+    fsm.on_visit_end = lambda _v, _s, _e, _d, discard: discarded.append(discard)
+
+    t = 0.0
+    for _ in range(6):  # ~0.25s of real presence -> visit starts
+        fsm.on_frame("cam1", qualified=True, timestamp=t)
+        t += 0.05
+    for _ in range(3):  # cat gone; advance well past the 10s exit window
+        fsm.on_frame("cam1", qualified=False, timestamp=t)
+        t += 6.0
+
+    assert discarded == [True]  # 0.25s presence < 2.0s min, despite the 12s window
+
+
 def test_short_visit_discarded() -> None:
     discarded: list[bool] = []
     fsm = VisitSessionFSM(
