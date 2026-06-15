@@ -125,11 +125,13 @@ mypy --ignore-missing-imports src/stupid_cat
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) gates on **ruff + pytest** (GPU tests
-skipped) and runs **mypy** non-blocking.
+skipped) **+ mypy**.
 
 ## Known limitations
 
 - Re-ID needs the reference photos above; until then most visits are `unknown`.
-- Cross-camera multi-cat (each cat only in one view) isn't flagged as multi-cat.
+- Cross-camera multi-cat (each cat only in one view) is detected only when
+  `session.cameras_overlap: false` (disjoint cameras); the default assumes both
+  cameras watch the same box.
 - Pee/poop and identity thresholds are heuristics — tune against real data.
 - `dinov2_*` downloads weights on first use (needs internet once).
