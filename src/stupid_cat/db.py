@@ -350,7 +350,11 @@ class Database:
                 "UPDATE visits SET waste_type = ?, waste_confidence = 1.0 WHERE id = ?",
                 (waste_type, visit_id),
             )
-            if old_waste != waste_type:
+            # Only log as a heuristic "correction" when it had actually predicted
+            # pee/poop. A first-time human label on an 'unknown' visit (multi-cat,
+            # waste disabled, or too short) isn't a misprediction and would pollute
+            # the predicted-vs-corrected accuracy report.
+            if old_waste != waste_type and old_waste in ("pee", "poop"):
                 conn.execute(
                     """
                     INSERT INTO waste_corrections

@@ -41,8 +41,11 @@ The pipeline runs a rotation pass every ~10 minutes (no scheduler needed):
 - `recorder.min_free_mb` — when free disk falls below this, the oldest clips are
   deleted until it's satisfied (and new recording is paused until then).
 
-Set both in `config.yaml` (or `config.local.yaml`). The standalone
-`scripts/prune_recordings.py` remains for one-off manual cleanup.
+Set both in `config.yaml` (or `config.local.yaml`). Prefer this in-process
+retention as the **single owner** of cleanup. `scripts/prune_recordings.py` is a
+standalone tool for one-off manual cleanup only — don't also schedule it (e.g. the
+`StupidCat-PruneRecordings` task from `install_scheduled_tasks.ps1`) while
+in-process retention is on, or two deleters race over the same directory.
 
 ## Database + recordings backup (scheduled)
 

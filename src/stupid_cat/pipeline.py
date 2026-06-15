@@ -408,6 +408,9 @@ class Pipeline:
             self._thread.join(timeout=join_timeout)
             if self._thread.is_alive():
                 logger.warning("pipeline thread did not stop within %.0fs", join_timeout)
+        # Idempotent (run()'s finally also closes it); guarantees the MQTT loop
+        # thread is torn down even on a stop-without-run path.
+        self.mqtt.close()
 
     def start_background(self, sources: list[FrameSource]) -> None:
         self._thread = threading.Thread(
