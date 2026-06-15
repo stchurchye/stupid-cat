@@ -156,6 +156,9 @@ class VisitSessionFSM:
             self.visit_id = None
             self.started_at = None
             self._visit_first_qualified = None
+            # Clear per-camera presence so the next visit's discard/duration can't
+            # read a stale latch from this one (matters if timestamps ever step back).
+            self._last_qualified_at = dict.fromkeys(self.camera_ids, 0.0)
             if enter_cooldown:
                 self.state = "cooldown"
                 self.cooldown_until = timestamp + self.cooldown_sec

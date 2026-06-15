@@ -785,3 +785,35 @@ def test_overlapping_cameras_not_flagged_multicat(tmp_path: Path) -> None:
     visit = _run_two_cats_two_cameras(_dual_pipeline(tmp_path, cameras_overlap=True))
     assert visit["max_cats"] == 1
     assert visit["multi_cat"] is False
+
+
+def test_multicat_flagged_when_one_overlapping_camera_sees_both(tmp_path: Path) -> None:
+    # Regression: cam1 sees both cats every frame, cam2 sees one. With a per-camera
+    # streak cam1 confirms multi-cat; the old global streak was reset by cam2's
+    # interleaved 1-cat frames and never confirmed.
+    pipe = _dual_pipeline(tmp_path, cameras_overlap=True)
+
+    class _PerCam:
+        in_roi = True
+
+        def detect(self, frame, camera_id):
+            if not self.in_roi:
+                return []
+            if camera_id == "cam1":
+                return [(150.0, 150.0, 250.0, 250.0), (300.0, 150.0, 400.0, 250.0)]
+            return [(150.0, 150.0, 250.0, 250.0)]
+
+    pipe.detector = _PerCam()
+    t = 0.0
+    for _ in range(12):
+        pipe._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+        pipe._process_frame(FrameEvent("cam2", _frame(), t))
+        t += 0.05
+    pipe.detector.in_roi = False
+    for _ in range(20):
+        pipe._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    visit = pipe.db.list_visits(only_ended=True)[0]
+    assert visit["max_cats"] >= 2
+    assert visit["multi_cat"] is True
