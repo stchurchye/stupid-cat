@@ -1,6 +1,6 @@
 import numpy as np
 
-from stupid_cat.ingest import VideoFileSource, motion_score, rate_limited
+from stupid_cat.ingest import motion_score, rate_limited
 
 
 def test_motion_score_increases_on_change() -> None:

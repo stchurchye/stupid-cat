@@ -24,6 +24,7 @@ from stupid_cat.ingest import (
     _motion_gray,
     motion_score,
 )
+from stupid_cat.mqtt import MqttPublisher
 from stupid_cat.preprocess import preprocess_frame
 from stupid_cat.recorder import VisitRecorder, reencode_for_browser, visit_recording_filename
 from stupid_cat.reid import (
@@ -166,6 +167,9 @@ class Pipeline:
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
         self._last_retention_mono = 0.0
+        # Optional MQTT alerting (no-op unless mqtt.enabled). Started in run().
+        self.mqtt = MqttPublisher(cfg.mqtt)
+        self._mqtt_streak_alerted = False
         self._consecutive_frame_errors = 0
         # Set while a visit is active so ingest records at full fps (not throttled
         # to idle by a still cat). Wall-clock time of the last qualified detection,
@@ -414,6 +418,7 @@ class Pipeline:
         )
         self._ingest = ingest
         self._ingest_active = True
+        self.mqtt.start()
         try:
             for event in ingest.events():
                 if self._stop.is_set():
@@ -434,6 +439,7 @@ class Pipeline:
                 try:
                     if self._process_frame(event):
                         self._consecutive_frame_errors = 0  # reset only on real work
+                        self._mqtt_streak_alerted = False
                 except Exception:  # noqa: BLE001 - one bad frame must not kill 24/7 ingest
                     self._consecutive_frame_errors += 1
                     logger.exception(
@@ -441,10 +447,17 @@ class Pipeline:
                         event.camera_id,
                         self._consecutive_frame_errors,
                     )
+                    if self._consecutive_frame_errors >= 30 and not self._mqtt_streak_alerted:
+                        self._mqtt_streak_alerted = True  # once per fault episode
+                        self.mqtt.publish(
+                            "alert/frame_errors",
+                            {"streak": self._consecutive_frame_errors, "camera_id": event.camera_id},
+                        )
         finally:
             ingest.stop()
             self._ingest = None
             self._ingest_active = False
+            self.mqtt.close()
 
     def _disk_ok(self) -> bool:
         """True if free disk space is above recorder.min_free_mb (throttled warn)."""
@@ -464,6 +477,10 @@ class Pipeline:
                 "low disk space (%.0f MB free < %d MB); skipping recording",
                 free / 1024 / 1024,
                 self.cfg.recorder.min_free_mb,
+            )
+            self.mqtt.publish(
+                "alert/low_disk",
+                {"free_mb": round(free / 1024 / 1024), "min_mb": self.cfg.recorder.min_free_mb},
             )
         return False
 
@@ -911,6 +928,19 @@ class Pipeline:
 
         self._visit_started_at = None
         self._embedding_buffer = None
+        self.mqtt.publish(
+            "visit_ended",
+            {
+                "visit_id": visit_id,
+                "cat_id": cat_id,
+                "confidence": round(confidence, 3),
+                "duration_sec": duration_sec,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "max_cats": max_cats,
+                "waste_type": waste_type,
+            },
+        )
         logger.info(
             "visit ended %s cat=%s conf=%.2f max_cats=%d waste=%s(%.2f) dig=%.1f",
             visit_id, cat_id, confidence, max_cats, waste_type, waste_confidence, digging_motion,
