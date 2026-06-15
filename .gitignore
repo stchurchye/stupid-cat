@@ -12,6 +12,7 @@ data/
 config.local.yaml
 models/*.pt
 yolo11s.pt
+exports/*.zip
 
 .tmp/
 .pip-cache/
