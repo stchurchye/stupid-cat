@@ -1,4 +1,4 @@
-# Win1060 setup helper
+# Win1060 setup helper — cu121 torch + project deps
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path | Split-Path -Parent
 Set-Location $Root
@@ -17,9 +17,10 @@ if (-not (Test-Path $py)) {
 
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
+pip install -r requirements-win-cuda.txt
 pip install -e ".[dev]"
 
-# YOLO 权重
+# YOLO weights (~18MB)
 if (-not (Test-Path "models\yolo11s.pt")) {
     python -c @"
 from pathlib import Path
@@ -34,11 +35,13 @@ print('Downloaded models/yolo11s.pt')
 
 if (-not (Test-Path "config.local.yaml")) {
     Copy-Item "config.local.yaml.example" "config.local.yaml"
-    Write-Host "Created config.local.yaml — edit RTSP URLs and device."
+    Write-Host "Created config.local.yaml — edit RTSP URLs, device, and ROI."
 }
+
+python -c "import torch; print('torch', torch.__version__); print('cuda', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
 
 Write-Host ""
 Write-Host "Done. Next steps:"
-Write-Host "  1. Edit config.local.yaml (RTSP URLs, device)"
-Write-Host "  2. Optional GPU: .\scripts\install-cuda.ps1"
-Write-Host "  3. Start: .\scripts\start.ps1  or  .\scripts\start-api-only.ps1"
+Write-Host "  1. Edit config.local.yaml (RTSP URLs, device cuda:0, ROI)"
+Write-Host "  2. Optional: install ffmpeg and add to PATH (browser playback)"
+Write-Host "  3. Start: .\scripts\start.ps1  or  python -m stupid_cat serve"
