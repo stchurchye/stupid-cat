@@ -80,8 +80,18 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         return db.list_cats()
 
     @app.get("/api/v1/visits")
-    def list_visits(from_ts: str | None = None, to_ts: str | None = None, cat_id: str | None = None) -> list:
-        visits = db.list_visits(from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True)
+    def list_visits(
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        cat_id: str | None = None,
+        limit: int = 1000,
+    ) -> list:
+        # Bound the result (and the per-visit recording-file stat()s) so the
+        # timeline stays responsive after months of 24/7 visits.
+        limit = max(1, min(limit, 5000))
+        visits = db.list_visits(
+            from_ts=from_ts, to_ts=to_ts, cat_id=cat_id, only_ended=True, limit=limit
+        )
         return [_enrich_visit(pipeline, v) for v in visits]
 
     @app.get("/api/v1/stats")
@@ -148,8 +158,11 @@ def create_app(pipeline: Pipeline, db: Database) -> FastAPI:
         pipeline.resume()
         return {"paused": False}
 
-    if recordings_dir.exists():
-        app.mount("/recordings", StaticFiles(directory=recordings_dir), name="recordings")
+    # Create the dir up front so the mount always succeeds; otherwise on a fresh
+    # install it doesn't exist yet at startup and every /recordings/* URL 404s
+    # until the process is restarted after the first visit.
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/recordings", StaticFiles(directory=recordings_dir), name="recordings")
     if static_dir.exists():
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
