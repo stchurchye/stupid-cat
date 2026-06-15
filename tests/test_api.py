@@ -165,9 +165,12 @@ def test_camera_preview_returns_jpeg(tmp_path: Path) -> None:
     cfg_path = Path(__file__).resolve().parents[1] / "config.yaml"
     cfg = load_config(cfg_path)
     db = Database(tmp_path / "test.db")
+    import time as _time
+
     pipeline = Pipeline(cfg, db=db, data_dir=tmp_path / "data")
     with pipeline._preview_lock:
         pipeline._preview_frames["cam1"] = np.zeros((120, 160, 3), dtype=np.uint8)
+        pipeline._preview_ts["cam1"] = _time.monotonic()  # fresh, else staleness-gated
 
     app = create_app(pipeline, db)
     client = TestClient(app)

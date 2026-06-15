@@ -235,15 +235,20 @@ class Database:
         to_ts: str | None = None,
         cat_id: str | None = None,
         only_ended: bool = False,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
 
+        # Compare via SQLite datetime(): it parses the ISO offset and normalizes
+        # to UTC, so a from_ts/to_ts in a different offset than the stored
+        # timestamps still filters by the correct instant (a raw string >= would
+        # be lexicographic and wrong across offsets).
         if from_ts is not None:
-            clauses.append("started_at >= ?")
+            clauses.append("datetime(started_at) >= datetime(?)")
             params.append(from_ts)
         if to_ts is not None:
-            clauses.append("started_at <= ?")
+            clauses.append("datetime(started_at) <= datetime(?)")
             params.append(to_ts)
         if cat_id is not None:
             clauses.append("cat_id = ?")
@@ -253,6 +258,9 @@ class Database:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"SELECT * FROM visits {where} ORDER BY started_at DESC"
+        if limit is not None and limit >= 0:
+            sql += " LIMIT ?"
+            params.append(limit)
         with self._lock:
             rows = self._connection().execute(sql, params).fetchall()
         return [self._row_to_visit(r) for r in rows]

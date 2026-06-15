@@ -127,6 +127,7 @@ class Pipeline:
         self._preview_frames: dict[str, np.ndarray] = {}
         self._preview_boxes: dict[str, list[tuple[float, float, float, float]]] = {}
         self._preview_qualified: dict[str, bool] = {}
+        self._preview_ts: dict[str, float] = {}
         self._record_this_visit = False
         self._last_disk_warn_mono = 0.0
         self._consecutive_frame_errors = 0
@@ -145,13 +146,18 @@ class Pipeline:
             return
         clips_to_reencode: list[Path] = []
         for visit_id in ids:
-            clip = self.recordings_dir / f"{visit_id}.mp4"
-            if clip.exists():
-                try:
-                    self.db.set_recording_path(visit_id, str(clip))
-                except Exception:  # noqa: BLE001
-                    logger.exception("could not relink recording for %s", visit_id)
-                clips_to_reencode.append(clip)
+            # Match the primary '{id}.mp4' AND per-camera '{id}_{cam}.mp4' clips
+            # so a crash-interrupted dual-cam visit relinks/re-encodes every clip.
+            clips = sorted(self.recordings_dir.glob(f"{visit_id}*.mp4"))
+            if not clips:
+                continue
+            primary_clip = self.recordings_dir / f"{visit_id}.mp4"
+            link = primary_clip if primary_clip.exists() else clips[0]
+            try:
+                self.db.set_recording_path(visit_id, str(link))
+            except Exception:  # noqa: BLE001
+                logger.exception("could not relink recording for %s", visit_id)
+            clips_to_reencode.extend(clips)
         # Re-encode recovered clips off the startup-critical path so ingest can
         # begin immediately instead of blocking on serial ffmpeg transcodes.
         if clips_to_reencode:
@@ -264,18 +270,29 @@ class Pipeline:
     def camera_ids(self) -> list[str]:
         return [c.id for c in self.cfg.cameras]
 
-    def get_preview_jpeg(self, camera_id: str, *, quality: int = 82) -> bytes | None:
+    def get_preview_jpeg(
+        self, camera_id: str, *, quality: int = 82, max_age_sec: float = 10.0
+    ) -> bytes | None:
         with self._preview_lock:
             frame = self._preview_frames.get(camera_id)
             boxes = list(self._preview_boxes.get(camera_id, []))
             qualified = self._preview_qualified.get(camera_id, False)
             roi = list(self.roi_by_camera.get(camera_id, []))
+            ts = self._preview_ts.get(camera_id)
 
-        if frame is None:
+        # Treat a stale frame as "no frame" so the live UI shows a frozen/dead
+        # camera as waiting rather than a still image labelled connected.
+        if frame is None or ts is None or (_mono_now() - ts) > max_age_sec:
             return None
 
         annotated = frame.copy()
         if len(roi) >= 3:
+            # Scale the calibration-resolution ROI to the actual decoded frame so
+            # the drawn box matches where qualification happens (spec §7.3).
+            fh, fw = annotated.shape[:2]
+            sw, sh = self._stream_dims.get(camera_id, (fw, fh))
+            if sw > 0 and sh > 0 and (sw != fw or sh != fh):
+                roi = [[p[0] * fw / sw, p[1] * fh / sh] for p in roi]
             pts = np.array(roi, dtype=np.int32)
             cv2.polylines(annotated, [pts], True, (0, 255, 0), 2)
         for bbox in boxes:
@@ -479,16 +496,21 @@ class Pipeline:
             self._preview_frames[camera_id] = frame.copy()
             self._preview_boxes[camera_id] = boxes
             self._preview_qualified[camera_id] = qualified
+            self._preview_ts[camera_id] = _mono_now()
 
         if visit_active:
             with self._lock:
-                self._camera_ids_seen.add(camera_id)
-                if (
-                    self._record_this_visit
-                    and camera_id in self.record_camera_ids()
-                    and visit_id
-                ):
-                    self._write_visit_recording(camera_id, visit_id, frame)
+                # Re-read LIVE fsm state under the lock: pause()/visit-end may have
+                # run since the first lock block was released. Writing to a cleared
+                # recorder would recreate (and truncate) the just-finalized clip.
+                if self.fsm.state == "active" and self.fsm.visit_id == visit_id:
+                    self._camera_ids_seen.add(camera_id)
+                    if (
+                        self._record_this_visit
+                        and camera_id in self.record_camera_ids()
+                        and visit_id
+                    ):
+                        self._write_visit_recording(camera_id, visit_id, frame)
 
         if not embed_work:
             return False
@@ -572,6 +594,10 @@ class Pipeline:
         recording_paths = self._stop_visit_recorders(reencode=not discard)
         self.recorder.stop(reencode=not discard)
         recording_path = recording_paths.get(self.cfg.recorder.primary_camera)
+        if recording_path is None and recording_paths:
+            # Primary never qualified but a secondary cam recorded — still store a
+            # clip path so the DB row / crash-recovery has something to point at.
+            recording_path = next(iter(recording_paths.values()))
         self._recording_path = None
 
         if discard:
@@ -591,7 +617,16 @@ class Pipeline:
             return
 
         if self._best_correction_crops:
-            self._save_correction_crops(visit_id, self._best_correction_crops)
+            # Save only the single best (largest) crop for the visit: one
+            # appearance = one ref, so a dual-camera visit isn't double-counted in
+            # the unweighted centroid (and one correction can't satisfy min_refs).
+            best_cam = max(
+                self._best_correction_crops,
+                key=lambda cam: self._best_correction_areas.get(cam, -1.0),
+            )
+            self._save_correction_crops(
+                visit_id, {best_cam: self._best_correction_crops[best_cam]}
+            )
         self._best_correction_crops = {}
         self._best_correction_areas = {}
 
@@ -659,65 +694,115 @@ class Pipeline:
         """
         self.centroids = {**self.centroids, cat_id: centroid}
 
+    def _collect_visit_ref_crops(self, visit_id: str) -> dict[str, np.ndarray]:
+        """Read this visit's already-saved refs (from a prior correction) so a
+        re-correction can re-apply them to a different cat."""
+        crops: dict[str, np.ndarray] = {}
+        cats_dir = self._data_dir / "cats"
+        if not cats_dir.is_dir():
+            return crops
+        prefix = f"{visit_id}_"
+        for cat_dir in sorted(cats_dir.iterdir()):
+            refs = cat_dir / "refs"
+            if not refs.is_dir():
+                continue
+            for path in sorted(refs.glob(f"{visit_id}_*.jpg")):
+                cam = path.name[len(prefix):].removesuffix(".jpg")
+                if cam and cam not in crops:
+                    img = cv2.imread(str(path))
+                    if img is not None:
+                        crops[cam] = img
+            legacy = refs / f"{visit_id}.jpg"
+            if legacy.exists() and self.cfg.recorder.primary_camera not in crops:
+                img = cv2.imread(str(legacy))
+                if img is not None:
+                    crops[self.cfg.recorder.primary_camera] = img
+        return crops
+
+    def _delete_visit_refs(self, visit_id: str, *, except_cat: str | None = None) -> set[str]:
+        """Delete this visit's refs from every cat except ``except_cat``.
+
+        Returns the ids of cats whose refs changed (so their centroids rebuild)."""
+        affected: set[str] = set()
+        cats_dir = self._data_dir / "cats"
+        if not cats_dir.is_dir():
+            return affected
+        for cat_dir in cats_dir.iterdir():
+            if not cat_dir.is_dir() or cat_dir.name == except_cat:
+                continue
+            refs = cat_dir / "refs"
+            if not refs.is_dir():
+                continue
+            removed = False
+            paths = list(refs.glob(f"{visit_id}_*.jpg")) + [refs / f"{visit_id}.jpg"]
+            for path in paths:
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                    removed = True
+            if removed:
+                affected.add(cat_dir.name)
+        return affected
+
+    def _rebuild_centroid_for(self, cat_id: str) -> None:
+        """Rebuild (or remove) one cat's centroid from its current refs. Heavy
+        build runs off the pipeline lock; only the swap/remove is locked."""
+        cat_dir = self._data_dir / "cats" / cat_id
+        refs_dir = cat_dir / "refs"
+        centroid = None
+        if refs_dir.is_dir():
+            centroid = build_centroid_from_refs(
+                self.embedder, refs_dir, self.cfg.preprocess, self.cfg.cats.min_refs
+            )
+        centroid_path = cat_dir / "centroid.npy"
+        if centroid is None:
+            centroid_path.unlink(missing_ok=True)
+            with self._lock:
+                if cat_id in self.centroids:
+                    self.centroids = {k: v for k, v in self.centroids.items() if k != cat_id}
+        else:
+            np.save(centroid_path, centroid)
+            with self._lock:
+                self._set_centroid(cat_id, centroid)
+
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
-        """DB correction plus optional ref append and centroid rebuild (spec §9.3).
+        """DB correction plus ref move and centroid rebuild (spec §9.3).
 
-        One correction applies to the whole visit: every per-camera crop saved at
-        visit end is appended to refs/ and the cat centroid is rebuilt once.
-
-        The expensive centroid rebuild (a Re-ID forward pass per ref image) runs
-        WITHOUT the pipeline lock so an admin correction can't freeze frame
-        ingest / the FSM watchdog; only the cheap copy-on-write swap is locked.
-        The DB and Embedder each have their own internal locks.
+        A correction re-assigns the WHOLE visit: the visit's representative crop is
+        moved to the new cat's refs and removed from any cat it was previously
+        assigned to (re-correction must not leave stale refs biasing the old cat).
+        Both affected cats' centroids are rebuilt. Correcting to ``unknown`` just
+        removes the visit's learning. Heavy rebuilds run off the pipeline lock.
         """
         allowed = {c["id"] for c in self.db.list_cats()} | {"unknown"}
         if new_cat_id not in allowed:
             raise ValueError(f"cat_id not registered: {new_cat_id}")
 
         self.db.correct_visit(visit_id, new_cat_id)
-        if new_cat_id == "unknown":
-            self._delete_correction_crops(visit_id)
-            return
 
-        crops = self._load_correction_crops(visit_id)
-        if not crops:
-            logger.warning("no correction crops for visit %s; DB updated only", visit_id)
-            return
+        # Crop source: the freshly-captured crops (first correction) or, if those
+        # were already consumed, the refs saved under the previous cat.
+        crops = self._load_correction_crops(visit_id) or self._collect_visit_ref_crops(visit_id)
+        rebuild_cats = self._delete_visit_refs(visit_id, except_cat=new_cat_id)
 
-        cat_dir = self._data_dir / "cats" / new_cat_id
-        refs_dir = cat_dir / "refs"
-        refs_dir.mkdir(parents=True, exist_ok=True)
-        refs_written = 0
-        for camera_id, crop in crops.items():
-            ref_path = refs_dir / f"{visit_id}_{camera_id}.jpg"
-            if cv2.imwrite(str(ref_path), crop):
-                refs_written += 1
+        if new_cat_id != "unknown":
+            if crops:
+                refs_dir = self._data_dir / "cats" / new_cat_id / "refs"
+                refs_dir.mkdir(parents=True, exist_ok=True)
+                for camera_id, crop in crops.items():
+                    ref_path = refs_dir / f"{visit_id}_{camera_id}.jpg"
+                    if cv2.imwrite(str(ref_path), crop):
+                        rebuild_cats.add(new_cat_id)
+                    else:
+                        logger.warning("failed to write ref %s", ref_path)
             else:
-                logger.warning("failed to write ref %s", ref_path)
-        if refs_written == 0:
-            return
+                logger.warning("no correction crops for visit %s; DB updated only", visit_id)
 
         self._delete_correction_crops(visit_id)
 
-        centroid = build_centroid_from_refs(
-            self.embedder,
-            refs_dir,
-            self.cfg.preprocess,
-            self.cfg.cats.min_refs,
-        )
-        if centroid is None:
-            logger.info(
-                "saved %d ref(s) for %s; centroid unchanged (need %d refs)",
-                refs_written,
-                new_cat_id,
-                self.cfg.cats.min_refs,
-            )
-            return
-
-        np.save(cat_dir / "centroid.npy", centroid)
-        with self._lock:
-            self._set_centroid(new_cat_id, centroid)
-        logger.info("rebuilt centroid for %s", new_cat_id)
+        for cat in rebuild_cats:
+            self._rebuild_centroid_for(cat)
+        if rebuild_cats:
+            logger.info("correction rebuilt centroids for %s", sorted(rebuild_cats))
 
     def rebuild_cat_centroid(self, cat_id: str) -> bool:
         """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding).

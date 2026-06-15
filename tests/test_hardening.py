@@ -98,6 +98,25 @@ def test_finalize_orphan_visits_closes_open_rows(tmp_path: Path) -> None:
     db.close()
 
 
+def test_list_visits_time_filter_is_offset_aware(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    # Stored in +08:00 (09:00+08 == 01:00 UTC).
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-15T09:00:00+08:00")
+    db.end_visit(vid, cat_id="unknown", ended_at="2026-06-15T09:05:00+08:00",
+                 duration_sec=300, confidence=0.0)
+    # A UTC window that DOES contain the instant -> returned.
+    inside = db.list_visits(from_ts="2026-06-15T00:30:00+00:00",
+                            to_ts="2026-06-15T01:30:00+00:00", only_ended=True)
+    assert [r["id"] for r in inside] == [vid]
+    # A UTC window that does NOT contain the instant, but WOULD if compared as raw
+    # strings ('...09:00:00+08:00' >= '...08:30:00+00:00' lexicographically).
+    outside = db.list_visits(from_ts="2026-06-15T08:30:00+00:00",
+                             to_ts="2026-06-15T10:00:00+00:00", only_ended=True)
+    assert outside == []
+    db.close()
+
+
 def test_delete_visit_removes_row_and_corrections(tmp_path: Path) -> None:
     db = Database(tmp_path / "t.db")
     db.init_schema()

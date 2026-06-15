@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 from requests.auth import HTTPDigestAuth
@@ -24,11 +24,12 @@ class CameraTarget:
     password: str
     device_name: str
     osd_name: str
+    username: str = "admin"
 
 
-def _session(password: str) -> requests.Session:
+def _session(username: str, password: str) -> requests.Session:
     s = requests.Session()
-    s.auth = HTTPDigestAuth("admin", password)
+    s.auth = HTTPDigestAuth(username, password)
     s.headers["Content-Type"] = "application/xml"
     return s
 
@@ -58,7 +59,10 @@ def parse_rtsp_cameras(config_path: Path) -> list[CameraTarget]:
         url = cam.get("rtsp_url", "")
         parsed = urlparse(url)
         ip = parsed.hostname
-        password = parsed.password or ""
+        # RTSP URLs percent-encode credentials (@, :, / are URL delimiters), so
+        # decode before using them for HTTP digest auth, or auth will 401.
+        password = unquote(parsed.password or "")
+        username = unquote(parsed.username or "admin")
         if not ip or not password:
             continue
         cam_id = cam.get("id", ip)
@@ -69,6 +73,7 @@ def parse_rtsp_cameras(config_path: Path) -> list[CameraTarget]:
                 password=password,
                 device_name=display,
                 osd_name=display,
+                username=username,
             )
         )
     return out
@@ -77,7 +82,9 @@ def parse_rtsp_cameras(config_path: Path) -> list[CameraTarget]:
 def _replace_tag(text: str, tag: str, value: str) -> str:
     pat = rf"(<{tag}>)([^<]*)(</{tag}>)"
     if re.search(pat, text):
-        return re.sub(pat, rf"\1{value}\3", text, count=1)
+        # Use a function replacement so backslashes / \1-like sequences in `value`
+        # (e.g. a camera name) aren't interpreted as regex group references.
+        return re.sub(pat, lambda m: f"{m.group(1)}{value}{m.group(3)}", text, count=1)
     return text
 
 
@@ -183,7 +190,7 @@ def set_overlays(session: requests.Session, ip: str, osd_name: str) -> None:
 
 
 def configure_camera(cam: CameraTarget) -> None:
-    session = _session(cam.password)
+    session = _session(cam.username, cam.password)
     set_device_name(session, cam.ip, cam.device_name)
     set_time(session, cam.ip)
     set_overlays(session, cam.ip, cam.osd_name)

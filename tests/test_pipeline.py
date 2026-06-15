@@ -242,6 +242,53 @@ def test_correct_visit_appends_dual_camera_refs(fast_pipeline: Pipeline, tmp_pat
     assert (refs_dir / f"{visit_id}_cam2.jpg").exists()
 
 
+def test_recorrection_moves_ref_between_cats(fast_pipeline: Pipeline, tmp_path: Path) -> None:
+    visit_id = "visit-recorr"
+    crop = np.zeros((100, 100, 3), dtype=np.uint8)
+    fast_pipeline._save_correction_crops(visit_id, {"cam1": crop})
+    fast_pipeline.db.create_visit(visit_id=visit_id, cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    fast_pipeline.db.end_visit(visit_id, cat_id="unknown", ended_at="2026-06-02T10:01:00+08:00",
+                               duration_sec=60, confidence=0.0)
+
+    fast_pipeline.correct_visit(visit_id, "mimi")
+    mimi_ref = tmp_path / "data" / "cats" / "mimi" / "refs" / f"{visit_id}_cam1.jpg"
+    assert mimi_ref.exists()
+
+    # Re-correct to a different cat: the ref must MOVE, not be orphaned under mimi.
+    fast_pipeline.correct_visit(visit_id, "cat2")
+    cat2_ref = tmp_path / "data" / "cats" / "cat2" / "refs" / f"{visit_id}_cam1.jpg"
+    assert cat2_ref.exists()
+    assert not mimi_ref.exists()
+    assert fast_pipeline.db.get_visit(visit_id)["cat_id"] == "cat2"
+
+
+def test_preview_stale_frame_returns_none(fast_pipeline: Pipeline, monkeypatch) -> None:
+    import stupid_cat.pipeline as pmod
+
+    with fast_pipeline._preview_lock:
+        fast_pipeline._preview_frames["cam1"] = np.zeros((48, 64, 3), dtype=np.uint8)
+        fast_pipeline._preview_ts["cam1"] = 1000.0
+
+    monkeypatch.setattr(pmod, "_mono_now", lambda: 1005.0)  # 5s old -> fresh
+    assert fast_pipeline.get_preview_jpeg("cam1") is not None
+    monkeypatch.setattr(pmod, "_mono_now", lambda: 1020.0)  # 20s old -> stale
+    assert fast_pipeline.get_preview_jpeg("cam1") is None
+
+
+def test_orphan_recovery_relinks_secondary_clip(fast_pipeline: Pipeline) -> None:
+    rec_dir = fast_pipeline.recordings_dir
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    vid = fast_pipeline.db.create_visit(cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    # Only a secondary-camera clip exists (primary never recorded before the crash).
+    (rec_dir / f"{vid}_cam2.mp4").write_bytes(b"\x00\x00")
+
+    fast_pipeline._recover_orphan_visits()
+    row = fast_pipeline.db.get_visit(vid)
+    assert row["ended_at"] is not None
+    assert row["recording_path"] is not None
+    assert row["recording_path"].endswith(f"{vid}_cam2.mp4")
+
+
 def test_dual_camera_recording_writes_both_clips(tmp_path: Path) -> None:
     repo_cfg = Path(__file__).resolve().parents[1] / "config.yaml"
     data = yaml.safe_load(repo_cfg.read_text(encoding="utf-8"))
@@ -282,6 +329,47 @@ def test_dual_camera_recording_writes_both_clips(tmp_path: Path) -> None:
     rec_dir = pipeline.recordings_dir
     assert (rec_dir / f"{visit['id']}.mp4").exists()
     assert (rec_dir / f"{visit['id']}_cam2.mp4").exists()
+
+
+def test_dual_camera_visit_saves_single_correction_crop(tmp_path: Path) -> None:
+    # A dual-camera visit must save ONE correction crop (one appearance = one
+    # ref), not one per camera, or the unweighted centroid double-counts it.
+    repo_cfg = Path(__file__).resolve().parents[1] / "config.yaml"
+    data = yaml.safe_load(repo_cfg.read_text(encoding="utf-8"))
+    data["session"]["enter_overlap_sec"] = 0.05
+    data["session"]["exit_no_cat_sec"] = 0.1
+    data["session"]["cooldown_sec"] = 0.05
+    data["session"]["min_visit_sec"] = 0.01
+    data["recorder"]["enabled"] = False
+    for cam in data["cameras"]:
+        cam["stream_width"] = 640
+        cam["stream_height"] = 480
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.dump(data), encoding="utf-8")
+    cfg = load_config(cfg_path)
+    pipeline = Pipeline(
+        cfg, db=Database(tmp_path / "t.db"), data_dir=tmp_path / "data",
+        detector=FakeDetector(), embedder=FakeEmbedder(),
+    )
+
+    # Textured crop so it passes ref_quality_ok (a flat crop would be rejected).
+    textured = np.zeros((480, 640, 3), dtype=np.uint8)
+    textured[150:250, 150:250] = (np.arange(100).reshape(100, 1) % 200).astype(np.uint8)[:, :, None]
+
+    t = 0.0
+    for _ in range(10):
+        pipeline._process_frame(FrameEvent("cam1", textured, t))
+        pipeline._process_frame(FrameEvent("cam2", textured, t))
+        t += 0.05
+    pipeline.detector.in_roi = False
+    for _ in range(20):
+        pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        pipeline._process_frame(FrameEvent("cam2", _frame(), t))
+        t += 0.05
+
+    crop_dir = tmp_path / "data" / "correction_crops"
+    saved = list(crop_dir.glob("*.jpg")) if crop_dir.is_dir() else []
+    assert len(saved) == 1
 
 
 def test_recording_continues_without_detection(fast_pipeline: Pipeline) -> None:
