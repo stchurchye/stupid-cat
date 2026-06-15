@@ -30,10 +30,12 @@ from stupid_cat.reid import (
     EmbeddingBuffer,
     EmbeddingRecord,
     Embedder,
-    build_centroid_from_refs,
+    build_gallery_from_refs,
+    centroid_from_gallery,
+    color_histogram,
     fuse_embeddings,
-    load_all_centroids,
-    match_cat,
+    load_identities,
+    match_identity,
     ref_quality_ok,
 )
 from stupid_cat.session import VisitSessionFSM
@@ -120,8 +122,13 @@ class Pipeline:
             device=cfg.inference.device,
             backbone=cfg.inference.reid_backbone,
             fp16=cfg.inference.fp16,
+            grayscale=cfg.inference.reid_grayscale,
         )
-        self.centroids = load_all_centroids(self._data_dir / "cats")
+        # centroids (legacy mean, kept for fusion), galleries (multi-vector match),
+        # color_galleries (daytime bonus). All copy-on-write; see _set_identity.
+        self.centroids, self.galleries, self.color_galleries = load_identities(
+            self._data_dir / "cats"
+        )
         # Only enabled cameras drive ingest / the FSM exit set.
         self._cameras = [c for c in cfg.cameras if c.enabled]
         if not self._cameras:
@@ -714,6 +721,7 @@ class Pipeline:
             logger.info("visit %s discarded (duration %.2fs)", visit_id, duration)
             return
 
+        best_color_crop = None
         if self._best_correction_crops:
             # Save only the single best (largest) crop for the visit: one
             # appearance = one ref, so a dual-camera visit isn't double-counted in
@@ -722,9 +730,8 @@ class Pipeline:
                 self._best_correction_crops,
                 key=lambda cam: self._best_correction_areas.get(cam, -1.0),
             )
-            self._save_correction_crops(
-                visit_id, {best_cam: self._best_correction_crops[best_cam]}
-            )
+            best_color_crop = self._best_correction_crops[best_cam]
+            self._save_correction_crops(visit_id, {best_cam: best_color_crop})
         self._best_correction_crops = {}
         self._best_correction_areas = {}
 
@@ -739,10 +746,23 @@ class Pipeline:
                 self.cfg.inference.fusion,
                 centroids=self.centroids or None,
             )
-            cat_id, confidence = match_cat(
+            # Daytime colour bonus: a hue/sat histogram of the best crop, or None
+            # when the crop is grayscale (night IR) — match_identity then ignores it.
+            visit_color = None
+            if self.cfg.inference.color_bonus_enabled and best_color_crop is not None:
+                visit_color = color_histogram(
+                    best_color_crop,
+                    min_saturation=self.cfg.inference.color_min_saturation,
+                )
+            cat_id, confidence = match_identity(
                 visit_vector,
+                self.galleries,
                 self.centroids,
                 self.cfg.inference.similarity_threshold,
+                topk=self.cfg.inference.reid_topk,
+                visit_color=visit_color,
+                color_galleries=self.color_galleries,
+                color_weight=self.cfg.inference.color_weight,
             )
             frames_used = len(self._embedding_buffer)
         else:
@@ -814,14 +834,27 @@ class Pipeline:
                 visit_id, max_cats,
             )
 
-    def _set_centroid(self, cat_id: str, centroid: np.ndarray) -> None:
-        """Replace the centroids dict atomically (copy-on-write).
-
-        Readers in the pipeline thread snapshot ``self.centroids`` and iterate the
-        snapshot, so rebinding here can never raise "dict changed size during
-        iteration"; the lock additionally serializes concurrent writers.
-        """
+    def _set_identity(
+        self,
+        cat_id: str,
+        centroid: np.ndarray,
+        gallery: np.ndarray,
+        color_gallery: np.ndarray | None,
+    ) -> None:
+        """Copy-on-write swap of all three identity maps for one cat (caller holds
+        the lock). The colour gallery is removed when a cat has no colourful refs."""
         self.centroids = {**self.centroids, cat_id: centroid}
+        self.galleries = {**self.galleries, cat_id: gallery}
+        if color_gallery is not None:
+            self.color_galleries = {**self.color_galleries, cat_id: color_gallery}
+        else:
+            self.color_galleries = {k: v for k, v in self.color_galleries.items() if k != cat_id}
+
+    def _remove_identity(self, cat_id: str) -> None:
+        """Drop a cat from all three identity maps (caller holds the lock)."""
+        self.centroids = {k: v for k, v in self.centroids.items() if k != cat_id}
+        self.galleries = {k: v for k, v in self.galleries.items() if k != cat_id}
+        self.color_galleries = {k: v for k, v in self.color_galleries.items() if k != cat_id}
 
     def _collect_visit_ref_crops(self, visit_id: str) -> dict[str, np.ndarray]:
         """Read this visit's already-saved refs (from a prior correction) so a
@@ -872,26 +905,40 @@ class Pipeline:
                 affected.add(cat_dir.name)
         return affected
 
-    def _rebuild_centroid_for(self, cat_id: str) -> None:
-        """Rebuild (or remove) one cat's centroid from its current refs. Heavy
-        build runs off the pipeline lock; only the swap/remove is locked."""
+    def _rebuild_identity_for(self, cat_id: str) -> None:
+        """Rebuild (or remove) one cat's gallery + colour gallery + centroid from
+        its current refs. Heavy build runs off the pipeline lock; only the
+        swap/remove is locked."""
         cat_dir = self._data_dir / "cats" / cat_id
         refs_dir = cat_dir / "refs"
-        centroid = None
+        gallery = None
+        color_gallery = None
         if refs_dir.is_dir():
-            centroid = build_centroid_from_refs(
-                self.embedder, refs_dir, self.cfg.preprocess, self.cfg.cats.min_refs
+            gallery, color_gallery = build_gallery_from_refs(
+                self.embedder,
+                refs_dir,
+                self.cfg.preprocess,
+                self.cfg.cats.min_refs,
+                color_min_saturation=self.cfg.inference.color_min_saturation,
             )
         centroid_path = cat_dir / "centroid.npy"
-        if centroid is None:
-            centroid_path.unlink(missing_ok=True)
+        gallery_path = cat_dir / "gallery.npy"
+        color_path = cat_dir / "color_gallery.npy"
+        if gallery is None:
+            for p in (centroid_path, gallery_path, color_path):
+                p.unlink(missing_ok=True)
             with self._lock:
-                if cat_id in self.centroids:
-                    self.centroids = {k: v for k, v in self.centroids.items() if k != cat_id}
+                self._remove_identity(cat_id)
+            return
+        centroid = centroid_from_gallery(gallery)
+        np.save(centroid_path, centroid)
+        np.save(gallery_path, gallery)
+        if color_gallery is not None:
+            np.save(color_path, color_gallery)
         else:
-            np.save(centroid_path, centroid)
-            with self._lock:
-                self._set_centroid(cat_id, centroid)
+            color_path.unlink(missing_ok=True)
+        with self._lock:
+            self._set_identity(cat_id, centroid, gallery, color_gallery)
 
     def correct_visit(self, visit_id: str, new_cat_id: str) -> None:
         """DB correction plus ref move and centroid rebuild (spec §9.3).
@@ -919,7 +966,7 @@ class Pipeline:
             if crops:
                 self._save_correction_crops(visit_id, crops)
             for cat in rebuild_cats:
-                self._rebuild_centroid_for(cat)
+                self._rebuild_identity_for(cat)
             return
 
         if not crops:
@@ -948,30 +995,21 @@ class Pipeline:
         rebuild_cats.add(new_cat_id)
         self._delete_correction_crops(visit_id)
         for cat in rebuild_cats:
-            self._rebuild_centroid_for(cat)
+            self._rebuild_identity_for(cat)
         logger.info("correction rebuilt centroids for %s", sorted(rebuild_cats))
 
     def rebuild_cat_centroid(self, cat_id: str) -> bool:
-        """Rebuild one cat centroid from refs/ (spec §10 rebuild-embedding).
+        """Rebuild one cat's gallery/colour/centroid from refs/ (spec §10).
 
-        Centroid build runs off the pipeline lock; only the swap-in is locked.
+        Heavy build runs off the pipeline lock; only the swap-in is locked.
+        Returns True if a usable gallery was built (enough quality refs).
         """
         refs_dir = self._data_dir / "cats" / cat_id / "refs"
         if not refs_dir.is_dir():
             return False
-        centroid = build_centroid_from_refs(
-            self.embedder,
-            refs_dir,
-            self.cfg.preprocess,
-            self.cfg.cats.min_refs,
-        )
-        if centroid is None:
-            return False
-        cat_dir = refs_dir.parent
-        np.save(cat_dir / "centroid.npy", centroid)
+        self._rebuild_identity_for(cat_id)
         with self._lock:
-            self._set_centroid(cat_id, centroid)
-        return True
+            return cat_id in self.galleries
 
 
 def _mono_now() -> float:
