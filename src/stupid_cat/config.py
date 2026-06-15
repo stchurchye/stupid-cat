@@ -95,6 +95,9 @@ class PreprocessConfig:
 class RecorderConfig:
     enabled: bool = True
     primary_camera: str = "cam1"
+    # Which cameras to write visit clips from. Defaults to primary only; set
+    # [cam1, cam2] (or all enabled ids) for dual-angle review on the timeline.
+    record_cameras: list[str] | None = None
     max_seconds: int = 30
     min_free_mb: int = 500  # skip recording a visit if free disk space is below this
 
@@ -240,6 +243,14 @@ def validate_config(cfg: AppConfig) -> None:
             f"recorder.primary_camera '{cfg.recorder.primary_camera}' "
             f"must be an enabled camera, one of {enabled_ids}"
         )
+
+    if cfg.recorder.record_cameras is not None:
+        for cam_id in cfg.recorder.record_cameras:
+            if cam_id not in enabled_ids:
+                raise ConfigError(
+                    f"recorder.record_cameras contains '{cam_id}' "
+                    f"which is not an enabled camera; enabled: {enabled_ids}"
+                )
 
     if cfg.inference.fusion not in FUSION_MODES:
         raise ConfigError(

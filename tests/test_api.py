@@ -93,6 +93,37 @@ def test_cats_and_visits(client: TestClient, db: Database) -> None:
     visits = client.get("/api/v1/visits").json()
     assert len(visits) == 1
     assert visits[0]["cat_id"] == "mimi"
+    assert visits[0]["recordings"] == []
+
+
+def test_visit_recordings_dual_files(tmp_path: Path) -> None:
+    cfg_path = Path(__file__).resolve().parents[1] / "config.yaml"
+    cfg = load_config(cfg_path)
+    cfg.recorder.record_cameras = ["cam1", "cam2"]
+    db = Database(tmp_path / "test2.db")
+    pipeline = Pipeline(cfg, db=db, data_dir=tmp_path / "data")
+    vid = db.create_visit(cat_id="unknown", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(
+        vid,
+        cat_id="unknown",
+        ended_at="2026-06-02T10:02:00+08:00",
+        duration_sec=120,
+        confidence=0.0,
+        recording_path=f"data/recordings/{vid}.mp4",
+    )
+    rec_dir = pipeline.recordings_dir
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (rec_dir / f"{vid}.mp4").write_bytes(b"\x00")
+    (rec_dir / f"{vid}_cam2.mp4").write_bytes(b"\x00")
+
+    client = TestClient(create_app(pipeline, db))
+    visits = client.get("/api/v1/visits").json()
+    assert len(visits) == 1
+    recs = visits[0]["recordings"]
+    assert len(recs) == 2
+    urls = {r["camera_id"]: r["url"] for r in recs}
+    assert urls["cam1"] == f"/recordings/{vid}.mp4"
+    assert urls["cam2"] == f"/recordings/{vid}_cam2.mp4"
 
 
 def test_list_cameras(client: TestClient) -> None:
