@@ -18,6 +18,9 @@ inference:
   fusion: "weighted_median"
   fusion_max_frames: 64
   fp16: false               # half precision; only applied when device is cuda:*
+  # 接受为"猫"的 COCO 类别:蹲着/背对的猫常被 YOLO 误判成羊/狗/熊,盆里又只会有猫,
+  # 所以放宽到这组动物类,避免漏检导致一次如厕被切成多段。15猫16狗17马18羊19牛21熊77泰迪熊
+  detect_class_ids: [15, 16, 17, 18, 19, 21, 77]
 
 cats:
   min_refs: 5

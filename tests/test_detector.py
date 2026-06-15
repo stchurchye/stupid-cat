@@ -57,6 +57,35 @@ def test_cat_detector_gates_until_confirmed(monkeypatch) -> None:
     assert detector.detect(frame, "cam1") == [fake_box]
 
 
+def test_detector_accepts_confused_animal_classes() -> None:
+    # A hunched/back-to-camera cat is frequently misclassified (e.g. as 'sheep');
+    # the box only ever holds a cat, so those classes count, but non-animals don't.
+    from stupid_cat.config import InferenceConfig
+
+    class _Box:
+        def __init__(self, cls, xyxy):
+            self.cls = [float(cls)]
+            self.xyxy = [np.array(xyxy, dtype=float)]
+            self.conf = [0.7]
+
+    class _Res:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+    class _Model:
+        def __init__(self, res):
+            self._res = res
+
+        def predict(self, *a, **k):
+            return self._res
+
+    det = CatDetector(InferenceConfig(yolo_confirm_frames=1))
+    det._model = _Model([_Res([_Box(18, [10, 20, 110, 120])])])  # 18 = sheep
+    assert det.detect_raw(np.zeros((16, 16, 3), dtype=np.uint8)) == [(10.0, 20.0, 110.0, 120.0)]
+    det._model = _Model([_Res([_Box(7, [0, 0, 5, 5])])])  # 7 = truck -> ignored
+    assert det.detect_raw(np.zeros((16, 16, 3), dtype=np.uint8)) == []
+
+
 @pytest.mark.gpu
 def test_cat_detector_detects_cat_class(tmp_path) -> None:
     pytest.importorskip("ultralytics")
