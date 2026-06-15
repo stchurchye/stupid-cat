@@ -53,6 +53,9 @@ class CatDetector:
         self._use_half = bool(getattr(cfg, "fp16", False)) and str(cfg.device).startswith(
             "cuda"
         )
+        # Accept these COCO class ids as "the cat" (a hunched cat is often
+        # misread as sheep/dog/bear; the box only ever holds a cat).
+        self._class_ids = set(getattr(cfg, "detect_class_ids", None) or [COCO_CAT_CLASS_ID])
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -78,7 +81,7 @@ class CatDetector:
             if result.boxes is None:
                 continue
             for box in result.boxes:
-                if int(box.cls[0]) != COCO_CAT_CLASS_ID:
+                if int(box.cls[0]) not in self._class_ids:
                     continue
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 boxes.append((float(x1), float(y1), float(x2), float(y2)))
