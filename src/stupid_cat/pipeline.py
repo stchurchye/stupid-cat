@@ -225,6 +225,9 @@ class Pipeline:
         self._paused.set()
         with self._lock:
             self.fsm.pause(_mono_now())
+            # Don't let a pre-pause error streak keep /health "degraded" while
+            # the system is intentionally (and healthily) paused.
+            self._consecutive_frame_errors = 0
 
     def resume(self) -> None:
         self._paused.clear()
@@ -271,8 +274,8 @@ class Pipeline:
                 if self._paused.is_set():
                     continue
                 try:
-                    self._process_frame(event)
-                    self._consecutive_frame_errors = 0
+                    if self._process_frame(event):
+                        self._consecutive_frame_errors = 0  # reset only on real work
                 except Exception:  # noqa: BLE001 - one bad frame must not kill 24/7 ingest
                     self._consecutive_frame_errors += 1
                     logger.exception(
@@ -347,7 +350,10 @@ class Pipeline:
         self._roi_scaled[camera_id] = (frame_w, frame_h, scaled)
         return scaled
 
-    def _process_frame(self, event: FrameEvent) -> None:
+    def _process_frame(self, event: FrameEvent) -> bool:
+        """Process one frame. Returns True only if it did Re-ID work (embedded a
+        crop), so the caller resets the error streak only on real work — an idle
+        frame neither resets nor masks a persistent embed fault."""
         camera_id = event.camera_id
 
         frame = preprocess_frame(event.frame_bgr, self.cfg.preprocess)
@@ -365,7 +371,7 @@ class Pipeline:
             self.fsm.on_frame(camera_id, qualified=qualified, timestamp=event.timestamp)
 
             if self.fsm.state != "active" or primary is None:
-                return
+                return False
 
             self._camera_ids_seen.add(camera_id)
             if (
@@ -381,24 +387,27 @@ class Pipeline:
             crop = _crop_bgr(frame, primary)
             short_side = min(crop.shape[0], crop.shape[1])
             if short_side < self.cfg.inference.min_crop_px or self._embedding_buffer is None:
-                return
+                return False
             # True bbox area (width * height) so buffer eviction keeps the
             # largest crops as spec §8.6 intends (was short_side**2 before).
             bbox_area = max(0.0, primary[2] - primary[0]) * max(0.0, primary[3] - primary[1])
             weight = self.camera_weights.get(camera_id, 0.5)
             visit_id = self.fsm.visit_id
+            best_area = self._best_correction_area
 
         # Re-ID forward pass is the slow part — run it WITHOUT the lock so the API
         # (/health) and the FSM watchdog aren't blocked for the inference time.
         # `crop` is a private copy and the Embedder is internally locked.
         embedding = self.embedder.embed(crop)
-        crop_ok = ref_quality_ok(crop)
+        # Only the larger-than-best crop can become the correction representative,
+        # so skip the (heavier) percentile quality check otherwise.
+        crop_ok = bbox_area > best_area and ref_quality_ok(crop)
 
         with self._lock:
             # The visit may have ended (e.g. via pause) while we embedded; only
             # attach to the still-current visit's buffer.
             if self._embedding_buffer is None or self.fsm.visit_id != visit_id:
-                return
+                return False
             # Keep the largest, clearest crop as the visit's representative for the
             # correction gallery — chosen by crop size, NOT by similarity to an
             # existing centroid (which would bias corrections toward whatever the
@@ -415,6 +424,7 @@ class Pipeline:
                     timestamp=event.timestamp,
                 )
             )
+            return True  # did real Re-ID work this frame
 
     def _on_visit_start(self, visit_id: str) -> None:
         # Defensively close any writer left open by an abnormally-ended visit so
@@ -626,7 +636,10 @@ def build_pipeline(
     pipeline = Pipeline(cfg)
 
     if video_path is not None:
-        cam_id = cfg.recorder.primary_camera
+        enabled_ids = [c.id for c in cfg.cameras if c.enabled]
+        # Use primary_camera if it's an enabled camera, else the first enabled one,
+        # so the FSM (built from enabled cameras) recognizes the source id.
+        cam_id = cfg.recorder.primary_camera if cfg.recorder.primary_camera in enabled_ids else enabled_ids[0]
         sources: list[FrameSource] = [VideoFileSource(cam_id, video_path)]
         return pipeline, sources
 

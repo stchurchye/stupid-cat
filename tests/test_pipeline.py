@@ -140,6 +140,21 @@ def test_recover_orphan_visits_on_construction(fast_pipeline: Pipeline, tmp_path
     assert row["ended_at"] is not None
 
 
+def test_process_frame_reports_work_only_when_embedding(fast_pipeline: Pipeline) -> None:
+    # A no-cat frame does no Re-ID work -> falsy (so it won't reset the error
+    # streak); frames during an active visit embed -> truthy.
+    fast_pipeline.detector.in_roi = False
+    assert not fast_pipeline._process_frame(FrameEvent("cam1", _frame(), 0.0))
+
+    fast_pipeline.detector.in_roi = True
+    did_work = False
+    t = 0.0
+    for _ in range(6):
+        t += 0.05
+        did_work = bool(fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))) or did_work
+    assert did_work is True
+
+
 def test_disk_guard_skips_recording_when_low(fast_pipeline: Pipeline, monkeypatch) -> None:
     import collections
 

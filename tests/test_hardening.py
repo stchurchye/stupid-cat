@@ -250,6 +250,31 @@ def test_all_cameras_disabled_is_error(tmp_path: Path) -> None:
         load_config(cfg_path)
 
 
+def test_recorder_disabled_allows_unused_primary_camera(tmp_path: Path) -> None:
+    # With recording off, primary_camera is unused at runtime, so a stale default
+    # that doesn't match (renamed) cameras must NOT hard-fail config load.
+    def _mutate(d: dict) -> None:
+        d["recorder"]["enabled"] = False
+        d["recorder"]["primary_camera"] = "cam1"
+        d["cameras"][0]["id"] = "front"
+        d["cameras"][1]["id"] = "back"
+
+    cfg = load_config(_write_cfg(tmp_path, _mutate))
+    assert cfg.recorder.enabled is False
+    assert [c.id for c in cfg.cameras] == ["front", "back"]
+
+
+def test_recorder_enabled_rejects_bad_primary_camera(tmp_path: Path) -> None:
+    def _mutate(d: dict) -> None:
+        d["recorder"]["enabled"] = True
+        d["cameras"][0]["id"] = "front"
+        d["cameras"][1]["id"] = "back"
+        d["recorder"]["primary_camera"] = "cam1"  # not an enabled camera
+
+    with pytest.raises(ConfigError, match="must be an enabled camera"):
+        load_config(_write_cfg(tmp_path, _mutate))
+
+
 # --- reference-image quality gate (keeps dark IR, drops blank) ---------------
 
 

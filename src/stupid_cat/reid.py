@@ -186,8 +186,9 @@ def load_centroid(path: Path | str) -> np.ndarray | None:
 def ref_quality_ok(frame: np.ndarray) -> bool:
     """True if a reference crop is large enough and has real texture.
 
-    Uses dynamic range (max-min) rather than absolute brightness so a dark IR
-    crop of a black cat is kept while a flat all-black/all-white patch is rejected.
+    Uses the p99-p1 percentile spread (not raw max-min, which a single hot/dead
+    pixel could inflate) rather than absolute brightness, so a dark IR crop of a
+    black cat is kept while a flat all-black/all-white patch is rejected.
     """
     if frame.ndim < 2:
         return False

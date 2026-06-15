@@ -80,7 +80,7 @@ class RtspSource:
         if params:
             try:
                 return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
-            except (cv2.error, TypeError):
+            except Exception:  # noqa: BLE001 - any builds rejecting the 3-arg form fall back
                 pass
         return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
 
@@ -141,13 +141,14 @@ def rate_limited(
         gray = _motion_gray(frame)
         # A reconnect can renegotiate a different resolution/aspect ratio, so the
         # gray shape may change mid-stream; absdiff would raise on a mismatch.
-        # Treat a shape change as "no motion this frame" and re-baseline.
+        # Treat the first frame and any shape change as idle (no motion) and
+        # re-baseline — set active directly so this holds even if motion_threshold
+        # is 0 (where score >= 0 would otherwise read as active).
         if prev_gray is None or prev_gray.shape != gray.shape:
-            score = 0.0
+            active = False
         else:
-            score = motion_score(prev_gray, gray)
+            active = motion_score(prev_gray, gray) >= motion_threshold
         prev_gray = gray
-        active = score >= motion_threshold
         target_fps = active_fps if active else idle_fps
         interval = 1.0 / max(target_fps, 0.1)
 

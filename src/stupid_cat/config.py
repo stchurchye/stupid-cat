@@ -231,9 +231,10 @@ def validate_config(cfg: AppConfig) -> None:
     if not enabled_ids:
         raise ConfigError("at least one camera must be enabled")
 
-    # Always required: --video uses primary_camera as the ingest source id, and
-    # the recorder uses it when enabled — either way it must be an enabled camera.
-    if cfg.recorder.primary_camera not in enabled_ids:
+    # Only required when recording is on; otherwise primary_camera is unused at
+    # runtime (the --video debug path falls back to the first enabled camera), so
+    # validating it unconditionally would reject otherwise-valid RTSP configs.
+    if cfg.recorder.enabled and cfg.recorder.primary_camera not in enabled_ids:
         raise ConfigError(
             f"recorder.primary_camera '{cfg.recorder.primary_camera}' "
             f"must be an enabled camera, one of {enabled_ids}"
