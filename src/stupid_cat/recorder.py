@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -33,6 +35,7 @@ class VisitRecorder:
         self._path: Path | None = None
         self._fourcc = "avc1"
         self._frames_written = 0
+        self._start_mono: float | None = None
 
     @property
     def frames_written(self) -> int:
@@ -45,6 +48,7 @@ class VisitRecorder:
         h, w = frame_bgr.shape[:2]
         self._writer, self._fourcc = _open_video_writer(self._path, self.fps, (w, h))
         self._frames_written = 0
+        self._start_mono = time.monotonic()
         self.write_frame(frame_bgr)
         return self._path
 
@@ -53,18 +57,31 @@ class VisitRecorder:
             return False
         if self._frames_written >= self._max_frames:
             return False
+        # Wall-clock cap: a near-still cat throttles to idle fps, so a fixed frame
+        # budget could span minutes; stop once real elapsed time exceeds the limit.
+        if self._start_mono is not None and time.monotonic() - self._start_mono > self.max_seconds:
+            return False
         self._writer.write(frame_bgr)
         self._frames_written += 1
         return True
 
-    def stop(self) -> Path | None:
+    def stop(self, *, reencode: bool = True) -> Path | None:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
         path = self._path
         self._path = None
-        if path is not None and self._fourcc == "mp4v":
-            reencode_for_browser(path)
+        if reencode and path is not None and self._fourcc == "mp4v":
+            # ffmpeg re-mux can take seconds and stop() runs inside the visit-end
+            # path that the pipeline holds a lock around — do it on a daemon thread
+            # so the 24/7 loop is never blocked. Skipped when the caller will
+            # discard the clip (reencode=False) to avoid racing the unlink.
+            threading.Thread(
+                target=reencode_for_browser,
+                args=(path,),
+                name=f"reencode-{path.stem}",
+                daemon=True,
+            ).start()
         return path
 
 
@@ -115,5 +132,12 @@ def reencode_for_browser(path: Path) -> bool:
         return True
     except subprocess.CalledProcessError as exc:
         logger.warning("ffmpeg reencode failed for %s: %s", path, exc.stderr.decode(errors="replace")[:200])
+        tmp.unlink(missing_ok=True)
+        return False
+    except OSError as exc:
+        # On Windows os.replace raises PermissionError/OSError if the target is
+        # open (e.g. being served/played); don't let the daemon thread die or
+        # leak the temp file.
+        logger.warning("could not replace %s after reencode: %s", path, exc)
         tmp.unlink(missing_ok=True)
         return False

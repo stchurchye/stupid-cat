@@ -23,7 +23,11 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO)
     cfg = load_config(args.config, local_path=Path("config.local.yaml") if Path("config.local.yaml").exists() else None)
-    embedder = Embedder(device=cfg.inference.device, backbone=cfg.inference.reid_backbone)
+    embedder = Embedder(
+        device=cfg.inference.device,
+        backbone=cfg.inference.reid_backbone,
+        fp16=cfg.inference.fp16,
+    )
 
     for cat_dir in sorted(args.data.iterdir()):
         if not cat_dir.is_dir():

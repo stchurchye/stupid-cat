@@ -40,6 +40,10 @@ def fast_pipeline(tmp_path: Path) -> Pipeline:
     data["session"]["cooldown_sec"] = 0.05
     data["session"]["min_visit_sec"] = 0.01
     data["cameras"] = [data["cameras"][0]]
+    # Test frames are 640x480; match the camera's calibration resolution so the
+    # ROI (authored in stream coords) maps 1:1 onto the frame (spec §7.3).
+    data["cameras"][0]["stream_width"] = 640
+    data["cameras"][0]["stream_height"] = 480
     cfg_path.write_text(yaml.dump(data), encoding="utf-8")
 
     cfg = load_config(cfg_path)
@@ -105,6 +109,84 @@ def test_visit_duration_uses_wall_clock(fast_pipeline: Pipeline) -> None:
     visit = fast_pipeline.db.list_visits(only_ended=True)[0]
     expected = _duration_seconds_wall(visit["started_at"], visit["ended_at"])
     assert visit["duration_sec"] == expected
+
+
+def test_visit_row_exists_during_active_visit(fast_pipeline: Pipeline) -> None:
+    # Persisting at visit start means an active (un-ended) row exists, so a crash
+    # mid-visit is recoverable instead of losing the visit entirely.
+    t = 0.0
+    for _ in range(5):
+        fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))
+        t += 0.05
+    active_id = fast_pipeline.fsm.visit_id
+    assert active_id is not None
+    row = fast_pipeline.db.get_visit(active_id)
+    assert row is not None
+    assert row["ended_at"] is None
+    # Not yet finalized, so it must not appear in the ended-only timeline.
+    assert fast_pipeline.db.list_visits(only_ended=True) == []
+
+
+def test_recover_orphan_visits_on_construction(fast_pipeline: Pipeline, tmp_path: Path) -> None:
+    # Simulate a crash: an open visit row with no ended_at.
+    orphan = fast_pipeline.db.create_visit(
+        cat_id="unknown", started_at="2026-06-02T10:00:00+08:00"
+    )
+    assert fast_pipeline.db.get_visit(orphan)["ended_at"] is None
+
+    # Re-running recovery (as __init__ does) finalizes it.
+    fast_pipeline._recover_orphan_visits()
+    row = fast_pipeline.db.get_visit(orphan)
+    assert row["ended_at"] is not None
+
+
+def test_process_frame_reports_work_only_when_embedding(fast_pipeline: Pipeline) -> None:
+    # A no-cat frame does no Re-ID work -> falsy (so it won't reset the error
+    # streak); frames during an active visit embed -> truthy.
+    fast_pipeline.detector.in_roi = False
+    assert not fast_pipeline._process_frame(FrameEvent("cam1", _frame(), 0.0))
+
+    fast_pipeline.detector.in_roi = True
+    did_work = False
+    t = 0.0
+    for _ in range(6):
+        t += 0.05
+        did_work = bool(fast_pipeline._process_frame(FrameEvent("cam1", _frame(), t))) or did_work
+    assert did_work is True
+
+
+def test_disk_guard_skips_recording_when_low(fast_pipeline: Pipeline, monkeypatch) -> None:
+    import collections
+
+    import stupid_cat.pipeline as pipeline_mod
+
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(pipeline_mod.shutil, "disk_usage", lambda _p: usage(100, 100, 0))
+    assert fast_pipeline._disk_ok() is False
+    # min_free_mb <= 0 disables the guard entirely.
+    fast_pipeline.cfg.recorder.min_free_mb = 0
+    assert fast_pipeline._disk_ok() is True
+
+
+def test_roi_scaled_to_actual_frame_resolution(fast_pipeline: Pipeline) -> None:
+    # Fixture calibrates the camera at 640x480.
+    roi_full = fast_pipeline._roi_for_frame("cam1", 640, 480)
+    roi_half = fast_pipeline._roi_for_frame("cam1", 320, 240)
+    # At the calibration resolution the ROI is unchanged; at half resolution
+    # every coordinate is halved (spec §7.3 substream support).
+    assert roi_half[0][0] == roi_full[0][0] / 2
+    assert roi_half[2][1] == roi_full[2][1] / 2
+
+
+def test_set_centroid_is_copy_on_write(fast_pipeline: Pipeline) -> None:
+    fast_pipeline.centroids = {"a": np.ones(4, dtype=np.float32)}
+    snapshot = fast_pipeline.centroids
+    fast_pipeline._set_centroid("b", np.zeros(4, dtype=np.float32))
+    # The live dict gained the new key; the captured snapshot is untouched, so a
+    # concurrent reader iterating the snapshot can never see a mid-write mutation.
+    assert "b" in fast_pipeline.centroids
+    assert "b" not in snapshot
+    assert fast_pipeline.centroids is not snapshot
 
 
 def test_correct_visit_appends_ref(fast_pipeline: Pipeline, tmp_path: Path) -> None:

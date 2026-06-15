@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -63,13 +65,37 @@ class RtspSource:
         self.url = url
         self.reconnect_delay_sec = reconnect_delay_sec
 
+    def _open(self) -> cv2.VideoCapture:
+        # OPEN/READ timeouts are open-only properties: they must be passed in the
+        # constructor params, NOT set() after opening (which is a no-op). This
+        # bounds the RTSP handshake so a half-dead host can't block the reader.
+        params: list[int] = []
+        for prop_name, value in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", 5000),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", 5000),
+        ):
+            prop = getattr(cv2, prop_name, None)
+            if prop is not None:
+                params += [int(prop), value]
+        if params:
+            try:
+                return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
+            except Exception:  # noqa: BLE001 - any builds rejecting the 3-arg form fall back
+                pass
+        return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+
     def frames(self) -> Iterator[np.ndarray]:
         while True:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap = self._open()
             if not cap.isOpened():
                 logger.warning("RTSP open failed for %s, retry in %.0fs", self.camera_id, self.reconnect_delay_sec)
                 time.sleep(self.reconnect_delay_sec)
                 continue
+            # Keep only the freshest frame (process live video, not a backlog).
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except cv2.error:
+                pass
             logger.info("RTSP connected: %s", self.camera_id)
             try:
                 while True:
@@ -88,6 +114,17 @@ def motion_score(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:
     return float(np.mean(diff))
 
 
+def _motion_gray(frame: np.ndarray) -> np.ndarray:
+    """Downsampled grayscale for motion gating — cheap on full-res IR frames."""
+    h, w = frame.shape[:2]
+    if w > 320:
+        scale = 320.0 / w
+        frame = cv2.resize(
+            frame, (320, max(1, int(h * scale))), interpolation=cv2.INTER_AREA
+        )
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
 def rate_limited(
     source: FrameSource,
     *,
@@ -101,10 +138,17 @@ def rate_limited(
     active = False
 
     for frame in source.frames():
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        score = 0.0 if prev_gray is None else motion_score(prev_gray, gray)
+        gray = _motion_gray(frame)
+        # A reconnect can renegotiate a different resolution/aspect ratio, so the
+        # gray shape may change mid-stream; absdiff would raise on a mismatch.
+        # Treat the first frame and any shape change as idle (no motion) and
+        # re-baseline — set active directly so this holds even if motion_threshold
+        # is 0 (where score >= 0 would otherwise read as active).
+        if prev_gray is None or prev_gray.shape != gray.shape:
+            active = False
+        else:
+            active = motion_score(prev_gray, gray) >= motion_threshold
         prev_gray = gray
-        active = score >= motion_threshold
         target_fps = active_fps if active else idle_fps
         interval = 1.0 / max(target_fps, 0.1)
 
@@ -116,23 +160,105 @@ def rate_limited(
 
 
 class MultiCameraIngest:
-    """Round-robin merge of per-camera rate-limited streams."""
+    """Merge per-camera streams, each read on its own thread.
 
-    def __init__(self, sources: list[FrameSource], *, active_fps: float, idle_fps: float, motion_threshold: float) -> None:
+    Each camera runs in a dedicated daemon thread feeding a bounded queue, so a
+    stall or RTSP reconnect on one camera never blocks the other (spec §4.1/§4.2).
+    When the queue fills, the oldest frame is dropped to bound end-to-end latency.
+    ``events()`` yields ``None`` as a heartbeat when no frame arrives within
+    ``poll_timeout`` so the consumer can drive wall-clock timeouts during a total
+    outage.
+    """
+
+    def __init__(
+        self,
+        sources: list[FrameSource],
+        *,
+        active_fps: float,
+        idle_fps: float,
+        motion_threshold: float,
+        queue_maxsize: int = 8,
+        poll_timeout: float = 0.5,
+    ) -> None:
         if not sources:
             raise ValueError("sources must not be empty")
-        self._generators = [
-            rate_limited(s, active_fps=active_fps, idle_fps=idle_fps, motion_threshold=motion_threshold)
-            for s in sources
-        ]
-        self._indices = list(range(len(self._generators)))
+        self._sources = list(sources)
+        self._active_fps = active_fps
+        self._idle_fps = idle_fps
+        self._motion_threshold = motion_threshold
+        self._poll_timeout = poll_timeout
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        # Count of readers that have exited. Tracked out-of-band (NOT via a
+        # sentinel in the bounded drop-oldest queue) so a dropped item can never
+        # lose a termination signal — which would otherwise hang events() for
+        # 3+ cameras under backpressure.
+        self._finished = 0
+        self._finished_lock = threading.Lock()
 
-    def events(self) -> Generator[FrameEvent, None, None]:
-        active = set(self._indices)
-        while active:
-            for idx in list(active):
-                gen = self._generators[idx]
-                try:
-                    yield next(gen)
-                except StopIteration:
-                    active.discard(idx)
+    def _put_drop_oldest(self, event: FrameEvent) -> None:
+        # The queue carries frames only; dropping the oldest can never lose a
+        # termination signal because readers signal completion via _finished.
+        try:
+            self._queue.put_nowait(event)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._queue.get_nowait()  # make room by dropping the oldest frame
+        except queue.Empty:
+            pass
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            pass
+
+    def _reader(self, source: FrameSource) -> None:
+        try:
+            for event in rate_limited(
+                source,
+                active_fps=self._active_fps,
+                idle_fps=self._idle_fps,
+                motion_threshold=self._motion_threshold,
+            ):
+                if self._stop.is_set():
+                    break
+                self._put_drop_oldest(event)
+        except Exception:  # noqa: BLE001 - one camera must not kill the others
+            logger.exception("ingest reader for %s crashed", getattr(source, "camera_id", "?"))
+        finally:
+            with self._finished_lock:
+                self._finished += 1
+
+    def _all_finished(self) -> bool:
+        with self._finished_lock:
+            return self._finished >= len(self._threads)
+
+    def events(self) -> Generator[FrameEvent | None, None, None]:
+        self._threads = [
+            threading.Thread(
+                target=self._reader,
+                args=(s,),
+                name=f"ingest-{s.camera_id}",
+                daemon=True,
+            )
+            for s in self._sources
+        ]
+        for thread in self._threads:
+            thread.start()
+
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=self._poll_timeout)
+            except queue.Empty:
+                # Terminate once every reader has exited and the queue is drained;
+                # otherwise emit a heartbeat so the consumer can drive timeouts.
+                if self._all_finished() and self._queue.empty():
+                    break
+                yield None
+                continue
+            yield item
+
+    def stop(self) -> None:
+        self._stop.set()

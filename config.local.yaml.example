@@ -1,10 +1,17 @@
 # 复制为 config.local.yaml（已在 .gitignore，勿提交密码）
 # inference:
 #   device: "cuda:0"          # Win1060；Mac 可省略或 cpu
+#   fp16: true                # cuda 上开半精度省显存（CPU/MPS 会自动忽略）
 
 # cameras:
+#   # 提示：roi_polygon 按拉流分辨率（stream_width × stream_height）标注；
+#   # 若改用子码流（更低分辨率）拉流，把 stream_width/height 改成子码流分辨率，
+#   # ROI 会自动按实际帧尺寸缩放（spec §7.3）。
 #   - id: cam1
 #     rtsp_url: "rtsp://user:pass@192.168.1.101:554/stream1"
+#     # enabled: false        # 临时停用某路（不影响另一路的退出判定）
+#     stream_width: 1920
+#     stream_height: 1080
 #     roi_polygon: [[100, 80], [500, 80], [500, 400], [100, 400]]
 #   - id: cam2
 #     rtsp_url: "rtsp://user:pass@192.168.1.102:554/stream1"

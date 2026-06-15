@@ -40,6 +40,7 @@ class InferenceConfig:
     similarity_threshold: float = 0.55
     fusion: str = "weighted_median"
     fusion_max_frames: int = 64
+    fp16: bool = False  # half precision; only applied on CUDA devices
 
 
 @dataclass
@@ -68,6 +69,7 @@ class CameraConfig:
     name: str = ""
     rtsp_url: str = ""
     weight: float = 0.5
+    enabled: bool = True
     stream_width: int = 1920
     stream_height: int = 1080
     roi_polygon: list[list[float]] = field(default_factory=list)
@@ -94,6 +96,7 @@ class RecorderConfig:
     enabled: bool = True
     primary_camera: str = "cam1"
     max_seconds: int = 30
+    min_free_mb: int = 500  # skip recording a visit if free disk space is below this
 
 
 @dataclass
@@ -211,21 +214,31 @@ def validate_config(cfg: AppConfig) -> None:
         raise ConfigError("cameras must contain at least one entry")
 
     camera_ids: list[str] = []
+    enabled_ids: list[str] = []
     for cam in cfg.cameras:
         if not cam.id:
             raise ConfigError("each camera requires a non-empty id")
         if cam.id in camera_ids:
             raise ConfigError(f"duplicate camera id: {cam.id}")
         camera_ids.append(cam.id)
+        if not cam.enabled:
+            continue  # disabled cameras are excluded from ingest/FSM/ROI checks
+        enabled_ids.append(cam.id)
         if len(cam.roi_polygon) < 3:
             raise ConfigError(f"camera {cam.id}: roi_polygon needs at least 3 points")
         if not is_convex_polygon(cam.roi_polygon):
             raise ConfigError(f"camera {cam.id}: roi_polygon must be convex")
 
-    if cfg.recorder.primary_camera not in camera_ids:
+    if not enabled_ids:
+        raise ConfigError("at least one camera must be enabled")
+
+    # Only required when recording is on; otherwise primary_camera is unused at
+    # runtime (the --video debug path falls back to the first enabled camera), so
+    # validating it unconditionally would reject otherwise-valid RTSP configs.
+    if cfg.recorder.enabled and cfg.recorder.primary_camera not in enabled_ids:
         raise ConfigError(
             f"recorder.primary_camera '{cfg.recorder.primary_camera}' "
-            f"must be one of {camera_ids}"
+            f"must be an enabled camera, one of {enabled_ids}"
         )
 
     if cfg.inference.fusion not in FUSION_MODES:
