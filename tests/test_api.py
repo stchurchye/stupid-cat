@@ -189,3 +189,21 @@ def test_camera_preview_returns_jpeg(tmp_path: Path) -> None:
     assert res.status_code == 200
     assert res.headers["content-type"] == "image/jpeg"
     assert res.content[:2] == b"\xff\xd8"
+
+
+def test_waste_accuracy_endpoint(client: TestClient, db: Database) -> None:
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+                 duration_sec=120, confidence=0.5, waste_type="pee", waste_confidence=0.5)
+    db.set_waste_type(vid, "poop")
+    body = client.get("/api/v1/waste/accuracy").json()
+    assert body["total_corrections"] == 1
+    assert body["confusion"]["pee->poop"] == 1
+
+
+def test_visit_exposes_digging_motion(client: TestClient, db: Database) -> None:
+    vid = db.create_visit(cat_id="mimi", started_at="2026-06-02T10:00:00+08:00")
+    db.end_visit(vid, cat_id="mimi", ended_at="2026-06-02T10:02:00+08:00",
+                 duration_sec=120, confidence=0.5, digging_motion=33.0)
+    visits = client.get("/api/v1/visits").json()
+    assert visits[0]["digging_motion"] == 33.0
