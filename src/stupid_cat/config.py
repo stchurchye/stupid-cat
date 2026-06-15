@@ -37,6 +37,18 @@ class InferenceConfig:
     motion_threshold: int = 25
     min_crop_px: int = 80
     reid_backbone: str = "efficientnet_b0"
+    # Embed cat crops on luminance (grayscale) so daytime-colour and night-IR
+    # frames share one feature space — one gallery then matches a cat day OR night.
+    reid_grayscale: bool = True
+    # Multi-vector gallery matching: score a cat by the mean of the top-k cosine
+    # similarities to its reference embeddings (robust to pose), not a single mean.
+    reid_topk: int = 3
+    # Daytime colour bonus: when a crop is colourful (not night IR), blend a
+    # hue/saturation-histogram match into the score with this weight. 5 cats with
+    # distinct coats separate well by colour; the bonus auto-disables at night.
+    color_bonus_enabled: bool = True
+    color_weight: float = 0.3
+    color_min_saturation: float = 25.0  # mean HSV S below this => treat as grayscale
     similarity_threshold: float = 0.55
     fusion: str = "weighted_median"
     fusion_max_frames: int = 64
@@ -266,6 +278,22 @@ def validate_config(cfg: AppConfig) -> None:
     if cfg.inference.fusion not in FUSION_MODES:
         raise ConfigError(
             f"inference.fusion must be one of {sorted(FUSION_MODES)}, got {cfg.inference.fusion!r}"
+        )
+
+    from stupid_cat.reid import REID_BACKBONES  # local import avoids an import cycle
+
+    if cfg.inference.reid_backbone not in REID_BACKBONES:
+        raise ConfigError(
+            f"inference.reid_backbone must be one of {sorted(REID_BACKBONES)}, "
+            f"got {cfg.inference.reid_backbone!r}"
+        )
+    if not 0.0 <= cfg.inference.color_weight <= 1.0:
+        raise ConfigError(
+            f"inference.color_weight must be in [0, 1], got {cfg.inference.color_weight}"
+        )
+    if cfg.inference.reid_topk < 1:
+        raise ConfigError(
+            f"inference.reid_topk must be >= 1, got {cfg.inference.reid_topk}"
         )
 
     if cfg.preprocess.input_mode not in INPUT_MODES:

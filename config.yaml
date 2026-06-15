@@ -13,7 +13,13 @@ inference:
   idle_fps: 1
   motion_threshold: 25
   min_crop_px: 80
-  reid_backbone: "efficientnet_b0"
+  reid_backbone: "efficientnet_b0"   # 认猫骨干网。想要更强的个体区分可换 "dinov2_vits14"
+                                      # (自监督 ViT,首次需联网下载~85MB;换后须重建每只猫的 refs)
+  reid_grayscale: true               # 在灰度域做嵌入 → 白天彩色 + 夜间红外用同一套画廊
+  reid_topk: 3                       # 多向量画廊:取与该猫参考集最相似的前 k 个余弦的均值
+  color_bonus_enabled: true          # 白天颜色加成(夜间红外自动关闭)
+  color_weight: 0.3                  # 颜色相似度在最终分里的权重(0~1)
+  color_min_saturation: 25.0         # 平均饱和度低于此视为灰度/红外,跳过颜色
   similarity_threshold: 0.55
   fusion: "weighted_median"
   fusion_max_frames: 64
