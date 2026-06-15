@@ -810,12 +810,13 @@ class Pipeline:
             cat_id, confidence = "unknown", 0.0
 
         # Pee/poop heuristic — only for a single-cat visit (a mixed visit's
-        # duration/digging belong to two cats).
+        # duration/digging belong to two cats). The late-phase digging mean is
+        # persisted regardless (even when waste is disabled) so the thresholds can
+        # be calibrated against real data later.
+        digging_motion = self._late_digging_motion()
         waste_type, waste_confidence = "unknown", 0.0
         if self.cfg.waste.enabled and max_cats < 2:
-            waste_type, waste_confidence = self._classify_waste(
-                duration_sec, self._late_digging_motion()
-            )
+            waste_type, waste_confidence = self._classify_waste(duration_sec, digging_motion)
 
         def _finalize() -> None:
             self.db.end_visit(
@@ -830,6 +831,7 @@ class Pipeline:
                 max_cats=max_cats,
                 waste_type=waste_type,
                 waste_confidence=waste_confidence,
+                digging_motion=digging_motion,
             )
 
         # The row was created at visit start; if it is somehow missing (start
@@ -848,7 +850,8 @@ class Pipeline:
         self._visit_started_at = None
         self._embedding_buffer = None
         logger.info(
-            "visit ended %s cat=%s conf=%.2f max_cats=%d", visit_id, cat_id, confidence, max_cats
+            "visit ended %s cat=%s conf=%.2f max_cats=%d waste=%s(%.2f) dig=%.1f",
+            visit_id, cat_id, confidence, max_cats, waste_type, waste_confidence, digging_motion,
         )
         if max_cats >= 2:
             logger.warning(

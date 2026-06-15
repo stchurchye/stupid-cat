@@ -137,6 +137,10 @@ async function loadVisits() {
       const wb = el("span", wasteLabel, "waste-badge");
       wb.style.marginLeft = "6px";
       wb.style.fontSize = "0.85em";
+      // Surface the signals behind the guess so the heuristic can be eyeballed/tuned.
+      const conf = typeof v.waste_confidence === "number" ? v.waste_confidence.toFixed(2) : "?";
+      const dig = typeof v.digging_motion === "number" ? v.digging_motion.toFixed(1) : "?";
+      wb.title = `启发式判断 置信度 ${conf} · 后段刨砂强度 ${dig} · 时长 ${v.duration_sec ?? "?"}s`;
       durTd.appendChild(wb);
     }
     tr.appendChild(durTd);
