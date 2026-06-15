@@ -171,7 +171,7 @@ def set_overlays(session: requests.Session, ip: str, osd_name: str) -> None:
             count=1,
         )
         body = re.sub(
-            rf"(<TextOverlay>\s*<id>4</id>.*?<displayText>)([^<]*)(</displayText>)",
+            r"(<TextOverlay>\s*<id>4</id>.*?<displayText>)([^<]*)(</displayText>)",
             rf"\1{re.escape(osd_name)}\3",
             body,
             count=1,

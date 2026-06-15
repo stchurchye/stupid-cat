@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from stupid_cat.recorder import VisitRecorder, visit_recording_filename
 
