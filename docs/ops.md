@@ -51,7 +51,7 @@ Set both in `config.yaml` (or `config.local.yaml`). The standalone
 can also archive recordings. It prunes its own old backup folders (`--keep`).
 
 ```bash
-python -m scripts.backup_db --zip-recordings --keep 14
+python scripts/backup_db.py --zip-recordings --keep 14
 ```
 
 ### Windows Task Scheduler (daily 03:00)
@@ -59,7 +59,7 @@ python -m scripts.backup_db --zip-recordings --keep 14
 ```powershell
 $py  = "C:\path\to\stupid-cat\.venv\Scripts\python.exe"
 $cwd = "C:\path\to\stupid-cat"
-$action  = New-ScheduledTaskAction -Execute $py -Argument "-m scripts.backup_db --keep 14" -WorkingDirectory $cwd
+$action  = New-ScheduledTaskAction -Execute $py -Argument "scripts\backup_db.py --keep 14" -WorkingDirectory $cwd
 $trigger = New-ScheduledTaskTrigger -Daily -At 3am
 Register-ScheduledTask -TaskName "stupid-cat-backup" -Action $action -Trigger $trigger -Description "Daily stupid-cat DB backup"
 ```
@@ -70,5 +70,5 @@ so a disk failure doesn't take the backups with it.
 ### cron (Linux, daily 03:00)
 
 ```cron
-0 3 * * * cd /path/to/stupid-cat && .venv/bin/python -m scripts.backup_db --keep 14
+0 3 * * * cd /path/to/stupid-cat && .venv/bin/python scripts/backup_db.py --keep 14
 ```
