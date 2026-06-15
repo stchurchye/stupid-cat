@@ -189,6 +189,15 @@ class Pipeline:
 
     def _recover_orphan_visits(self) -> None:
         """Finalize visits left open by a previous crash and relink any clips."""
+        # Sweep re-encode temp files left by an interrupted shutdown (reencode
+        # writes '<id>.browser.mp4' then replaces). These are unambiguous temps,
+        # safe to delete; left behind they just accumulate.
+        for tmp in self.recordings_dir.glob("*.browser.mp4"):
+            try:
+                tmp.unlink()
+                logger.info("removed stale re-encode temp %s", tmp.name)
+            except OSError:
+                pass
         try:
             ids = self.db.finalize_orphan_visits()
         except Exception:  # noqa: BLE001 - recovery must never block startup
@@ -372,12 +381,18 @@ class Pipeline:
     def resume(self) -> None:
         self._paused.clear()
 
-    def stop(self) -> None:
+    def stop(self, *, join_timeout: float = 20.0) -> None:
         self._stop.set()
         if self._ingest is not None:
             self._ingest.stop()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
+            # Generous timeout: an active visit finalizing at shutdown does
+            # embedding fusion, an off-lock gallery rebuild, DB writes, and (on a
+            # slow Windows disk) an ffmpeg re-encode — 5s was often too short and
+            # left an unfinalized visit that crash-recovery then had to clean up.
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                logger.warning("pipeline thread did not stop within %.0fs", join_timeout)
 
     def start_background(self, sources: list[FrameSource]) -> None:
         self._thread = threading.Thread(

@@ -108,6 +108,24 @@ def _open_video_writer(
     raise RuntimeError(f"cannot open video writer: {path}")
 
 
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 5, delay: float = 0.5) -> bool:
+    """os.replace with retry: on Windows the target raises PermissionError while
+    it's open (e.g. being served/played), which is usually transient."""
+    for i in range(attempts):
+        try:
+            tmp.replace(path)
+            return True
+        except OSError as exc:
+            if i == attempts - 1:
+                logger.warning(
+                    "could not replace %s after reencode (%d tries): %s", path, attempts, exc
+                )
+                tmp.unlink(missing_ok=True)
+                return False
+            time.sleep(delay)
+    return False
+
+
 def reencode_for_browser(path: Path) -> bool:
     """Re-mux to H.264 so Safari/Chrome can play in <video> (needs ffmpeg)."""
     ffmpeg = shutil.which("ffmpeg")
@@ -134,16 +152,10 @@ def reencode_for_browser(path: Path) -> bool:
             check=True,
             capture_output=True,
         )
-        tmp.replace(path)
-        return True
     except subprocess.CalledProcessError as exc:
-        logger.warning("ffmpeg reencode failed for %s: %s", path, exc.stderr.decode(errors="replace")[:200])
+        logger.warning(
+            "ffmpeg reencode failed for %s: %s", path, exc.stderr.decode(errors="replace")[:200]
+        )
         tmp.unlink(missing_ok=True)
         return False
-    except OSError as exc:
-        # On Windows os.replace raises PermissionError/OSError if the target is
-        # open (e.g. being served/played); don't let the daemon thread die or
-        # leak the temp file.
-        logger.warning("could not replace %s after reencode: %s", path, exc)
-        tmp.unlink(missing_ok=True)
-        return False
+    return _replace_with_retry(tmp, path)
