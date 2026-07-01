@@ -1,0 +1,2 @@
+- [Cameras: colour by day, IR by night](cameras-color-day-ir-night.md) — drives the day/night-robust identity design
+- [Re-ID identity design](reid-day-night-identity-design.md) — grayscale gallery + daytime colour bonus + optional DINOv2; still needs the user's IR ref photos
